@@ -1,6 +1,6 @@
 import { assign, createActor, fromPromise, setup, waitFor } from '@moonshot-ai/agent-core-v2/human/xstate2';
 
-import { startRemoteControl, type RemoteControlHandle } from './remote-control';
+import { startRemoteControl, type RemoteControlHandle, type RemoteControlStatus } from './remote-control';
 
 export type RemoteControlState = 'off' | 'starting' | 'on' | 'stopping';
 
@@ -27,6 +27,7 @@ export interface RemoteControlManagerOptions {
   readonly clientVersion: string;
   readonly relayOrigin?: string;
   readonly stderr?: Pick<NodeJS.WriteStream, 'write'>;
+  readonly onStatus?: (status: RemoteControlStatus) => void;
 }
 
 interface RemoteControlMachineContext {
@@ -54,6 +55,7 @@ function createRemoteControlMachine(
           clientVersion: options.clientVersion,
           relayOrigin: options.relayOrigin,
           stderr: options.stderr,
+          onStatus: options.onStatus,
         });
         onTunnelStarted(handle);
         return handle;

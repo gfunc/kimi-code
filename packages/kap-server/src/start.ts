@@ -81,6 +81,7 @@ import {
 import { TranscriptService } from './services/transcript/transcriptService';
 import { ProjectionService } from './services/projection';
 import { ModelCatalogRefreshScheduler } from './services/modelCatalog/modelCatalogRefreshScheduler';
+import { NotificationsService } from './services/notifications/notificationsService';
 import { startConfigChangedPublisher } from './services/config/configChangedPublisher';
 import { createAuthFailureLimiter } from './middleware/rateLimit';
 import { createRemoteControlManager } from '@moonshot-ai/remote-control';
@@ -196,11 +197,13 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
   const logging = resolveLoggingConfig({ homeDir, env: process.env });
   let boundPort = port;
   const localOriginHost = host.includes(':') ? `[${host}]` : host;
+  const notifications = new NotificationsService({ logger });
   const remoteControlManager = createRemoteControlManager({
     homeDir,
     localOrigin: () => `http://${localOriginHost}:${boundPort}`,
     localServerToken: () => authTokenService.getToken(),
     clientVersion: `kimi-code/${serverVersion}`,
+    onStatus: (status) => notifications.onRemoteControlStatus(status),
     stderr: {
       write: (text) => {
         logger.warn(String(text).trimEnd());
@@ -310,6 +313,7 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
       for (const client of wssDebug.clients) client.terminate();
     }
     configChangedPublisher.close();
+    notifications.close();
     await remoteControlManager.close();
     await app.close();
     configWarningSubscription.dispose();
@@ -357,6 +361,14 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     transcriptService,
   });
   const projectionService = new ProjectionService({ homeDir, core, logger });
+  try {
+    await notifications.start(core);
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error) },
+      'ntfy notifications startup failed; continuing without notifications',
+    );
+  }
 
   const configService = core.accessor.get(IConfigService);
   const publishConfigWarnings = (diagnostics: readonly ConfigDiagnostic[]): void => {
@@ -423,6 +435,7 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
           { name: 'fs', description: 'Filesystem operations' },
           { name: 'files', description: 'File upload & download' },
           { name: 'remote-control', description: 'Remote Control tunnel' },
+          { name: 'notifications', description: 'ntfy push notifications' },
         ],
       },
       transformObject: (documentObject) => {
@@ -463,7 +476,7 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
             : undefined,
     },
     onShutdown: () => {
-      void close().catch((err: unknown) => logger.error({ err }, 'server close failed'));
+      void close().catch((error: unknown) => logger.error({ error }, 'server close failed'));
     },
     connectionRegistry,
     broadcaster,
