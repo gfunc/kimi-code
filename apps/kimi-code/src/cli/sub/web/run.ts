@@ -9,6 +9,7 @@
  */
 
 import { existsSync } from 'node:fs';
+import { hostname as osHostname } from 'node:os';
 import { join } from 'node:path';
 
 import { createServerLogger, startServer, type ServerLogger } from '@moonshot-ai/kap-server';
@@ -21,7 +22,7 @@ import { getNativeWebAssetsDir } from '#/native/web-assets';
 import { darkColors } from '#/tui/theme/colors';
 import { openUrl as defaultOpenUrl } from '#/utils/open-url';
 import { getDataDir } from '#/utils/paths';
-import { generateRemoteControlQr } from '#/utils/remote-control-qr';
+import { generateQr, generateRemoteControlQr } from '#/utils/remote-control-qr';
 
 import { initializeServerTelemetry } from '../../telemetry';
 import {
@@ -36,7 +37,8 @@ import {
   isLoopbackHost,
   splitTokenFragment,
 } from './access-urls';
-import { type NetworkAddress } from './networks';
+import { listNetworkAddresses, type NetworkAddress } from './networks';
+import { buildPairingUri, pairingLanHost, PAIRING_QR_PNG_FILE } from './pairing';
 import {
   formatRemoteControlOutput,
   formatRemoteControlStatus,
@@ -102,6 +104,11 @@ export interface WebCommandDeps {
    * list in tests for deterministic output.
    */
   networkAddresses?: NetworkAddress[];
+  /**
+   * Machine alias embedded in the LAN pairing QR payload. Defaults to
+   * `os.hostname()`; inject a fixed one in tests for deterministic output.
+   */
+  hostname?: () => string;
   stdout: Pick<NodeJS.WriteStream, 'write'>;
   stderr: Pick<NodeJS.WriteStream, 'write'>;
 }
@@ -250,6 +257,7 @@ export async function handleWebCommand(
               token,
               networkAddresses: deps.networkAddresses,
               dangerousBypassAuth: parsed.dangerousBypassAuth,
+              pairingQr: await generatePairingQr(origin, parsed.host, token, deps),
             })
           : formatReadyLine(origin, token, parsed.dangerousBypassAuth),
       );
@@ -448,6 +456,53 @@ interface FormatReadyBannerOptions {
   networkAddresses?: NetworkAddress[];
   /** When true, render a red danger notice (auth is disabled). */
   dangerousBypassAuth?: boolean;
+  /** LAN pairing QR for the mobile app (spec §4.2); omitted when not pairable. */
+  pairingQr?: TerminalQr;
+}
+
+/** A terminal-rendered QR plus its PNG fallback path, as built by `generateQr`. */
+interface TerminalQr {
+  readonly qrCode: string;
+  readonly pngPath: string;
+}
+
+/**
+ * Render the LAN pairing QR for the ready banner.
+ *
+ * The QR encodes `kimi://pair?host&port&token&alias` — the out-of-band
+ * payload the mobile app scans (spec §4.2) — with the same plumbing as the
+ * Remote Control QR (inline image / half-blocks / PNG fallback). Best-effort
+ * and additive: loopback binds, an unresolvable token (`--dangerous-bypass-auth`
+ * or a missing token file), a wildcard bind without a usable LAN address, or a
+ * QR/PNG write failure all degrade to `undefined` — the Local/Network URLs
+ * above stay the primary way in.
+ */
+async function generatePairingQr(
+  origin: string,
+  bindHost: string,
+  token: string | undefined,
+  deps: Pick<WebCommandDeps, 'networkAddresses' | 'hostname'>,
+): Promise<TerminalQr | undefined> {
+  if (token === undefined) return undefined;
+  const host = pairingLanHost(bindHost, deps.networkAddresses ?? listNetworkAddresses());
+  if (host === undefined) return undefined;
+  const port = Number(origin.slice(origin.lastIndexOf(':') + 1));
+  const uri = buildPairingUri({
+    host,
+    port,
+    token,
+    alias: deps.hostname?.() ?? osHostname(),
+  });
+  try {
+    const { terminal: qrCode, pngPath } = await generateQr(
+      uri,
+      getDataDir(),
+      PAIRING_QR_PNG_FILE,
+    );
+    return { qrCode, pngPath };
+  } catch {
+    return undefined;
+  }
 }
 
 export function formatReadyBanner(
@@ -503,6 +558,19 @@ export function formatReadyBanner(
     // easy to spot without being highlighted.
     lines.push('');
     lines.push(`  ${label('Token:    ')}${opts.token}`);
+    lines.push('');
+  }
+
+  // LAN pairing QR for the mobile app: sits below the copyable URLs/token so
+  // those stay the primary entry points, and above the auxiliary controls.
+  if (opts.pairingQr !== undefined) {
+    lines.push(`  ${label('Pairing:  ')}${muted('scan with the Kimi mobile app')}`);
+    lines.push('');
+    lines.push(opts.pairingQr.qrCode.trimEnd().replaceAll(/^/gm, '  '));
+    lines.push('');
+    lines.push(
+      `  ${label('QR PNG:   ')}${opts.pairingQr.pngPath} ${muted('(open this if the QR above does not scan)')}`,
+    );
     lines.push('');
   }
 

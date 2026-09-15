@@ -37,7 +37,8 @@ export interface AccessUrlLine {
   url: string;
 }
 
-function isWildcard(host: string): boolean {
+/** True for wildcard bind hosts (`0.0.0.0` / `::` / empty) — all interfaces. */
+export function isWildcardHost(host: string): boolean {
   return host === '' || host === '0.0.0.0' || host === '::';
 }
 
@@ -49,7 +50,7 @@ function isWildcard(host: string): boolean {
 export function browserOpenOrigin(origin: string): string {
   const separator = origin.lastIndexOf(':');
   const host = origin.slice(origin.indexOf('://') + 3, separator);
-  if (!isWildcard(host)) return origin;
+  if (!isWildcardHost(host)) return origin;
   return `http://localhost${origin.slice(separator)}`;
 }
 
@@ -77,7 +78,7 @@ export function accessUrlLines(
   token: string | undefined,
   networkAddresses?: NetworkAddress[],
 ): AccessUrlLine[] {
-  if (isWildcard(host)) {
+  if (isWildcardHost(host)) {
     const lines: AccessUrlLine[] = [
       { label: 'Local:    ', url: buildOpenableUrl(`http://localhost:${port}`, token) },
     ];

@@ -7,13 +7,15 @@
  * subcommands against fake deps.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import chalk, { Chalk } from 'chalk';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import * as QRCode from 'qrcode';
 
 import { resetCapabilitiesCache, setCapabilities } from '@moonshot-ai/pi-tui';
 
@@ -339,6 +341,199 @@ describe('ready banner reflects the bind class', () => {
     expect(raw).not.toContain('Network:  http');
     expect(raw).not.toContain('192.0.2.66');
     expect(raw).not.toContain('╭');
+  });
+});
+
+describe('buildPairingUri', () => {
+  it('encodes the bound host, actual port, persistent token, and hostname alias', async () => {
+    const { buildPairingUri } = await import('#/cli/sub/web/pairing');
+    expect(
+      buildPairingUri({ host: '192.168.1.5', port: 58627, token: 'tok-abc', alias: 'devbox' }),
+    ).toBe('kimi://pair?host=192.168.1.5&port=58627&token=tok-abc&alias=devbox');
+  });
+
+  it('percent-encodes special characters in the query values', async () => {
+    const { buildPairingUri } = await import('#/cli/sub/web/pairing');
+    expect(
+      buildPairingUri({ host: '192.168.1.5', port: 58627, token: 'a b&c', alias: 'my box' }),
+    ).toBe('kimi://pair?host=192.168.1.5&port=58627&token=a%20b%26c&alias=my%20box');
+  });
+
+  it('rejects a missing host or token', async () => {
+    const { buildPairingUri } = await import('#/cli/sub/web/pairing');
+    expect(() =>
+      buildPairingUri({ host: '', port: 58627, token: 'tok', alias: 'devbox' }),
+    ).toThrow(/host/);
+    expect(() =>
+      buildPairingUri({ host: '192.168.1.5', port: 58627, token: '', alias: 'devbox' }),
+    ).toThrow(/token/);
+  });
+});
+
+describe('pairingLanHost', () => {
+  it('uses the primary LAN interface address for a wildcard bind', async () => {
+    const { pairingLanHost } = await import('#/cli/sub/web/pairing');
+    expect(
+      pairingLanHost('0.0.0.0', [
+        { address: '192.168.1.5', family: 'IPv4' },
+        { address: '198.51.100.7', family: 'IPv4' },
+        { address: '2001:db8::1', family: 'IPv6' },
+      ]),
+    ).toBe('192.168.1.5');
+    expect(pairingLanHost('::', [{ address: '2001:db8::1', family: 'IPv6' }])).toBe(
+      '2001:db8::1',
+    );
+  });
+
+  it('uses the bound host itself for a specific non-loopback bind', async () => {
+    const { pairingLanHost } = await import('#/cli/sub/web/pairing');
+    expect(pairingLanHost('10.0.0.5', [{ address: '192.168.1.5', family: 'IPv4' }])).toBe(
+      '10.0.0.5',
+    );
+  });
+
+  it('returns undefined for loopback binds or wildcard binds without LAN addresses', async () => {
+    const { pairingLanHost } = await import('#/cli/sub/web/pairing');
+    expect(
+      pairingLanHost('127.0.0.1', [{ address: '192.168.1.5', family: 'IPv4' }]),
+    ).toBeUndefined();
+    expect(pairingLanHost('0.0.0.0', [])).toBeUndefined();
+  });
+});
+
+describe('LAN pairing QR in the ready banner', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'kimi-pair-qr-'));
+    vi.stubEnv('KIMI_CODE_HOME', home);
+    // Force the half-block QR fallback so the banner output is deterministic.
+    setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetCapabilitiesCache();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('prints a scannable kimi://pair QR with the LAN IP, the actual port, the token, and the alias', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { renderTerminalQr } = await import('#/utils/remote-control-qr');
+    // The runner reports the actual bound origin: the port auto-incremented
+    // past the busy 58627 default. The QR must carry 58628, never 58627.
+    const { runner } = makeRunner('http://0.0.0.0:58628');
+    const { stdout, stderr, readStdout } = makeIo();
+
+    await handleWebCommand(
+      { host: '0.0.0.0', open: false },
+      {
+        startServerForeground: runner,
+        resolveToken: () => 'tok-pair',
+        networkAddresses: [
+          { address: '192.168.1.5', family: 'IPv4' },
+          { address: '198.51.100.7', family: 'IPv4' },
+        ],
+        hostname: () => 'devbox',
+        openUrl: vi.fn(),
+        stdout,
+        stderr,
+      },
+    );
+
+    const uri = 'kimi://pair?host=192.168.1.5&port=58628&token=tok-pair&alias=devbox';
+    const raw = readStdout();
+    // The terminal QR is exactly the half-block rendering of that payload
+    // (compare with the two-space banner indent removed).
+    const dedented = raw.split('\n').map((line) => line.replace(/^ {2}/, '')).join('\n');
+    expect(dedented).toContain(renderTerminalQr(uri));
+    // The PNG fallback encodes the same payload byte-for-byte.
+    expect(readFileSync(join(home, 'pairing-qrcode.png'))).toEqual(await QRCode.toBuffer(uri));
+
+    const plain = stripAnsi(raw);
+    expect(plain).toContain('Pairing:');
+    expect(plain).toContain(join(home, 'pairing-qrcode.png'));
+    // The QR sits after the token and before the auxiliary controls.
+    expect(plain.indexOf('Token:')).toBeLessThan(plain.indexOf('Pairing:'));
+    expect(plain.indexOf('Pairing:')).toBeLessThan(plain.indexOf('Logs:'));
+    // The existing Local/Network lines are unchanged alongside the QR.
+    expect(plain).toContain('http://localhost:58628/#token=tok-pair');
+    expect(plain).toContain('http://192.168.1.5:58628/#token=tok-pair');
+    expect(plain).toContain('http://198.51.100.7:58628/#token=tok-pair');
+  });
+
+  it('prints no pairing QR on a loopback bind', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { runner } = makeRunner('http://127.0.0.1:58627');
+    const { stdout, stderr, readStdout } = makeIo();
+
+    await handleWebCommand(
+      { host: '127.0.0.1', open: false },
+      {
+        startServerForeground: runner,
+        resolveToken: () => 'tok-loop',
+        networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+        hostname: () => 'devbox',
+        openUrl: vi.fn(),
+        stdout,
+        stderr,
+      },
+    );
+
+    const plain = stripAnsi(readStdout());
+    expect(plain).toContain('Kimi server ready');
+    expect(plain).not.toContain('Pairing:');
+    expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
+  });
+
+  it('prints no pairing QR when no token is available or auth is bypassed', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    for (const opts of [
+      { host: '0.0.0.0' as const, open: false },
+      { host: '0.0.0.0' as const, open: false, dangerousBypassAuth: true },
+    ]) {
+      const { runner } = makeRunner('http://0.0.0.0:58627');
+      const { stdout, stderr, readStdout } = makeIo();
+
+      await handleWebCommand(opts, {
+        startServerForeground: runner,
+        resolveToken: () => undefined,
+        networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+        hostname: () => 'devbox',
+        openUrl: vi.fn(),
+        stdout,
+        stderr,
+      });
+
+      const plain = stripAnsi(readStdout());
+      expect(plain).toContain('Kimi server ready');
+      expect(plain).not.toContain('Pairing:');
+      expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
+    }
+  });
+
+  it('prints no pairing QR on a wildcard bind without any LAN address', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { runner } = makeRunner('http://0.0.0.0:58627');
+    const { stdout, stderr, readStdout } = makeIo();
+
+    await handleWebCommand(
+      { host: '0.0.0.0', open: false },
+      {
+        startServerForeground: runner,
+        resolveToken: () => 'tok-pair',
+        networkAddresses: [],
+        hostname: () => 'devbox',
+        openUrl: vi.fn(),
+        stdout,
+        stderr,
+      },
+    );
+
+    const plain = stripAnsi(readStdout());
+    expect(plain).toContain('Kimi server ready');
+    expect(plain).not.toContain('Pairing:');
+    expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
   });
 });
 

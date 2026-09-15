@@ -17,16 +17,32 @@ const ANSI_RESET = '\u001B[0m';
 const QR_PNG_MARGIN = 4;
 const QR_IMAGE_MIN_PX_PER_MODULE = 4;
 
-export async function generateRemoteControlQr(
+/**
+ * Render a QR for terminal display and write a PNG fallback next to it.
+ *
+ * Shared plumbing behind every terminal QR (Remote Control relay URL, LAN
+ * pairing payload): the terminal string prefers the terminal's inline-image
+ * protocol (kitty / iterm2) and falls back to half-block art; the PNG goes to
+ * `<dataDir>/<pngFilename>` for terminals that cannot render either.
+ */
+export async function generateQr(
   url: string,
   dataDir: string,
+  pngFilename: string,
 ): Promise<{ terminal: string; pngPath: string }> {
   await mkdir(dataDir, { recursive: true });
-  const pngPath = resolve(dataDir, 'rc-qrcode.png');
+  const pngPath = resolve(dataDir, pngFilename);
   const png = await QRCode.toBuffer(url, { type: 'png', margin: QR_PNG_MARGIN });
   await writeFile(pngPath, png);
   const terminal = renderInlineImageQr(url, png) ?? renderTerminalQr(url);
   return { terminal, pngPath };
+}
+
+export async function generateRemoteControlQr(
+  url: string,
+  dataDir: string,
+): Promise<{ terminal: string; pngPath: string }> {
+  return generateQr(url, dataDir, 'rc-qrcode.png');
 }
 
 function renderInlineImageQr(url: string, png: Buffer): string | null {
