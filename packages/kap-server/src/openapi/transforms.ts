@@ -42,6 +42,11 @@ import {
   questionResolveResultSchema,
 } from '../protocol/rest-question';
 import {
+  importCatalogProviderResponseSchema,
+  importCustomRegistryResponseSchema,
+  providerCollectionActionBodySchema,
+} from '../protocol/rest-modelCatalog';
+import {
   archiveSessionResponseSchema,
   deleteSessionResponseSchema,
 } from '../protocol/rest-session';
@@ -63,48 +68,63 @@ const fileUploadMultipartSchema = {
 
 const errorEnvelopeSchema = openApiDocumentEnvelopeJsonSchema(z.null());
 
-const fsActionRequestSchema = {
-  oneOf: [
-    openApiDocumentJsonSchema(fsListRequestSchema),
-    openApiDocumentJsonSchema(fsReadRequestSchema),
-    openApiDocumentJsonSchema(fsListManyRequestSchema),
-    openApiDocumentJsonSchema(fsStatRequestSchema),
-    openApiDocumentJsonSchema(fsStatManyRequestSchema),
-    openApiDocumentJsonSchema(fsMkdirRequestSchema),
-    openApiDocumentJsonSchema(fsSearchRequestSchema),
-    openApiDocumentJsonSchema(fsGrepRequestSchema),
-    openApiDocumentJsonSchema(fsGitStatusRequestSchema),
-    openApiDocumentJsonSchema(fsDiffRequestSchema),
-    openApiDocumentJsonSchema(fsOpenRequestSchema),
-    openApiDocumentJsonSchema(fsOpenInRequestSchema),
-    openApiDocumentJsonSchema(fsRevealRequestSchema),
-  ],
-} as const;
-
-const fsActionResponseSchema = {
-  oneOf: [
-    openApiDocumentEnvelopeJsonSchema(fsListResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsReadResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsListManyResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsStatResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsStatManyResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsMkdirResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsSearchResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsGrepResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsGitStatusResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsDiffResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsOpenResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsOpenInResponseSchema),
-    openApiDocumentEnvelopeJsonSchema(fsRevealResponseSchema),
-  ],
-} as const;
-
 const questionResponseSchema = {
   oneOf: [
     openApiDocumentEnvelopeJsonSchema(questionResolveResultSchema),
     openApiDocumentEnvelopeJsonSchema(questionDismissResultSchema),
   ],
 } as const;
+
+const importCatalogProviderBodySchema = providerCollectionActionBodySchema.required({
+  catalog_id: true,
+});
+
+const importRegistryBodySchema = providerCollectionActionBodySchema.required({
+  url: true,
+});
+
+const fsActionSchemas = [
+  { action: 'list', request: fsListRequestSchema, response: fsListResponseSchema },
+  { action: 'read', request: fsReadRequestSchema, response: fsReadResponseSchema },
+  {
+    action: 'list_many',
+    request: fsListManyRequestSchema,
+    response: fsListManyResponseSchema,
+  },
+  { action: 'stat', request: fsStatRequestSchema, response: fsStatResponseSchema },
+  {
+    action: 'stat_many',
+    request: fsStatManyRequestSchema,
+    response: fsStatManyResponseSchema,
+  },
+  { action: 'mkdir', request: fsMkdirRequestSchema, response: fsMkdirResponseSchema },
+  { action: 'search', request: fsSearchRequestSchema, response: fsSearchResponseSchema },
+  { action: 'grep', request: fsGrepRequestSchema, response: fsGrepResponseSchema },
+  {
+    action: 'git_status',
+    request: fsGitStatusRequestSchema,
+    response: fsGitStatusResponseSchema,
+  },
+  { action: 'diff', request: fsDiffRequestSchema, response: fsDiffResponseSchema },
+  { action: 'open', request: fsOpenRequestSchema, response: fsOpenResponseSchema },
+  { action: 'open-in', request: fsOpenInRequestSchema, response: fsOpenInResponseSchema },
+  { action: 'reveal', request: fsRevealRequestSchema, response: fsRevealResponseSchema },
+] as const satisfies ReadonlyArray<{
+  readonly action: string;
+  readonly request: z.ZodTypeAny;
+  readonly response: z.ZodTypeAny;
+}>;
+
+interface ActionRouteProjection {
+  readonly path: string;
+  readonly operationId: string;
+  readonly description?: string;
+  readonly renameTailTo?: string;
+  readonly removeParams?: readonly string[];
+  readonly dropRequestBody?: boolean;
+  readonly requestBody?: Record<string, unknown>;
+  readonly responses?: Record<string, Record<string, unknown>>;
+}
 
 export function transformOpenApiDocument(
   document: Record<string, unknown>,
@@ -115,8 +135,13 @@ export function transformOpenApiDocument(
   patchFileUpload(paths);
   patchFileDownload(paths);
   patchSessionExport(paths);
-  patchSessionAction(paths);
-  patchFsAction(paths);
+  expandSessionActions(paths);
+  expandFsActions(paths);
+  expandPluginActions(paths);
+  expandModelActions(paths);
+  expandMcpServerActions(paths);
+  expandCapabilityActions(paths);
+  expandProviderCollectionActions(paths);
   patchFsDownload(paths);
   patchQuestionResolveOrDismiss(paths);
 
@@ -180,56 +205,200 @@ function patchFileDownload(paths: Record<string, unknown>): void {
   });
 }
 
-function patchSessionAction(paths: Record<string, unknown>): void {
-  const internalPath = '/api/v1/sessions/{tail}';
-  const pathItem = asRecord(paths[internalPath]);
-  const operation = asRecord(pathItem?.['post']);
-  if (pathItem === undefined || operation === undefined) return;
-
-  projectSessionAction(paths, pathItem, 'archive', 'runSessionArchiveAction', {
-    description: 'Session archive response',
-    content: jsonContent(openApiDocumentEnvelopeJsonSchema(archiveSessionResponseSchema)),
-  });
-  projectSessionAction(paths, pathItem, 'delete', 'runSessionDeleteAction', {
-    description: 'Session delete response',
-    content: jsonContent(openApiDocumentEnvelopeJsonSchema(deleteSessionResponseSchema)),
-  });
-  delete paths[internalPath];
+function expandSessionActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(paths, '/api/v1/sessions/{tail}', 'post', [
+    {
+      path: '/api/v1/sessions/{session_id}:archive',
+      operationId: 'runSessionArchiveAction',
+      renameTailTo: 'session_id',
+      responses: {
+        '200': {
+          description: 'Session archive response',
+          content: jsonContent(
+            openApiDocumentEnvelopeJsonSchema(archiveSessionResponseSchema),
+          ),
+        },
+      },
+    },
+    {
+      path: '/api/v1/sessions/{session_id}:delete',
+      operationId: 'runSessionDeleteAction',
+      renameTailTo: 'session_id',
+      responses: {
+        '200': {
+          description: 'Session delete response',
+          content: jsonContent(
+            openApiDocumentEnvelopeJsonSchema(deleteSessionResponseSchema),
+          ),
+        },
+      },
+    },
+  ]);
 }
 
-function projectSessionAction(
-  paths: Record<string, unknown>,
-  pathItem: Record<string, unknown>,
-  action: string,
-  operationId: string,
-  okResponse: Record<string, unknown>,
-): void {
-  const cloned = cloneRecord(pathItem);
-  replacePathParamName(cloned, 'tail', 'session_id');
-  const clonedOperation = asRecord(cloned['post']);
-  if (clonedOperation !== undefined) {
-    clonedOperation['operationId'] = operationId;
-    setResponse(clonedOperation, '200', okResponse);
-  }
-  paths[`/api/v1/sessions/{session_id}:${action}`] = cloned;
-}
-
-function patchFsAction(paths: Record<string, unknown>): void {
-  const operation = getOperation(paths, '/api/v1/sessions/{session_id}/{tail}', 'post');
-  if (operation === undefined) return;
-
-  operation['description'] = appendDescription(
-    operation['description'],
-    'The request and response schemas depend on the `fs:<action>` path tail and are represented as OpenAPI `oneOf` unions.',
+function expandFsActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(
+    paths,
+    '/api/v1/sessions/{session_id}/{tail}',
+    'post',
+    fsActionSchemas.map(({ action, request, response }) => ({
+      path: `/api/v1/sessions/{session_id}/fs:${action}`,
+      operationId: `runFs${pascalActionName(action)}Action`,
+      description: `Filesystem ${action} action for the session workspace.`,
+      removeParams: ['tail'],
+      requestBody: requiredJsonBody(openApiDocumentJsonSchema(request)),
+      responses: {
+        '200': {
+          description: `Filesystem ${action} response`,
+          content: jsonContent(openApiDocumentEnvelopeJsonSchema(response)),
+        },
+      },
+    })),
   );
-  operation['requestBody'] = {
-    required: true,
-    content: jsonContent(fsActionRequestSchema),
-  };
-  setResponse(operation, '200', {
-    description: 'Filesystem action response',
-    content: jsonContent(fsActionResponseSchema),
-  });
+}
+
+function expandPluginActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(paths, '/api/v1/plugins/{tail}', 'post', [
+    {
+      path: '/api/v1/plugins/{plugin_id}:enable',
+      operationId: 'runPluginEnableAction',
+      description: 'Enable an installed plugin',
+      renameTailTo: 'plugin_id',
+    },
+    {
+      path: '/api/v1/plugins/{plugin_id}:disable',
+      operationId: 'runPluginDisableAction',
+      description: 'Disable an installed plugin',
+      renameTailTo: 'plugin_id',
+    },
+    {
+      path: '/api/v1/plugins/{plugin_id}:remove',
+      operationId: 'runPluginRemoveAction',
+      description: 'Remove an installed plugin',
+      renameTailTo: 'plugin_id',
+    },
+  ]);
+}
+
+function expandModelActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(paths, '/api/v1/models/{tail}', 'post', [
+    {
+      path: '/api/v1/models/{model_id}:set_default',
+      operationId: 'setDefaultModel',
+      renameTailTo: 'model_id',
+    },
+  ]);
+}
+
+function expandMcpServerActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(paths, '/api/v1/mcp/servers/{tail}', 'post', [
+    {
+      path: '/api/v1/mcp/servers/{server_id}:restart',
+      operationId: 'restartMcpServer',
+      renameTailTo: 'server_id',
+    },
+  ]);
+}
+
+function expandCapabilityActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(paths, '/api/v1/capabilities/{tail}', 'post', [
+    {
+      path: '/api/v1/capabilities/{capability_id}:install',
+      operationId: 'installCapability',
+      renameTailTo: 'capability_id',
+    },
+  ]);
+}
+
+function expandProviderCollectionActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(paths, '/api/v1/providers{action}', 'post', [
+    {
+      path: '/api/v1/providers:refresh',
+      operationId: 'refreshProviders',
+      description: 'Refresh model metadata for all configured providers.',
+      removeParams: ['action'],
+      dropRequestBody: true,
+    },
+    {
+      path: '/api/v1/providers:refresh_oauth',
+      operationId: 'refreshOauthProviders',
+      description: 'Refresh model metadata for OAuth-backed providers only.',
+      removeParams: ['action'],
+      dropRequestBody: true,
+    },
+    {
+      path: '/api/v1/providers:import_catalog',
+      operationId: 'importCatalogProvider',
+      description: 'Import a models.dev directory entry as a configured provider (201).',
+      removeParams: ['action'],
+      requestBody: requiredJsonBody(
+        openApiDocumentJsonSchema(importCatalogProviderBodySchema),
+      ),
+      responses: {
+        '201': {
+          description: 'Provider imported from the catalog',
+          content: jsonContent(
+            openApiDocumentEnvelopeJsonSchema(importCatalogProviderResponseSchema),
+          ),
+        },
+      },
+    },
+    {
+      path: '/api/v1/providers:import_registry',
+      operationId: 'importCustomRegistry',
+      description: 'Import a models.dev-shaped private registry as configured providers (201).',
+      removeParams: ['action'],
+      requestBody: requiredJsonBody(openApiDocumentJsonSchema(importRegistryBodySchema)),
+      responses: {
+        '201': {
+          description: 'Registry imported',
+          content: jsonContent(
+            openApiDocumentEnvelopeJsonSchema(importCustomRegistryResponseSchema),
+          ),
+        },
+      },
+    },
+  ]);
+}
+
+function projectActionRoutes(
+  paths: Record<string, unknown>,
+  sourcePath: string,
+  method: string,
+  projections: readonly ActionRouteProjection[],
+): void {
+  const pathItem = asRecord(paths[sourcePath]);
+  if (pathItem === undefined || asRecord(pathItem[method]) === undefined) return;
+
+  for (const projection of projections) {
+    const cloned = cloneRecord(pathItem);
+    if (projection.removeParams !== undefined) {
+      removePathParams(cloned, projection.removeParams);
+    }
+    if (projection.renameTailTo !== undefined) {
+      replacePathParamName(cloned, 'tail', projection.renameTailTo);
+    }
+    const clonedOperation = asRecord(cloned[method]);
+    if (clonedOperation !== undefined) {
+      clonedOperation['operationId'] = projection.operationId;
+      if (projection.description !== undefined) {
+        clonedOperation['description'] = projection.description;
+      }
+      if (projection.dropRequestBody === true) {
+        delete clonedOperation['requestBody'];
+      }
+      if (projection.requestBody !== undefined) {
+        clonedOperation['requestBody'] = projection.requestBody;
+      }
+      if (projection.responses !== undefined) {
+        for (const [statusCode, response] of Object.entries(projection.responses)) {
+          setResponse(clonedOperation, statusCode, response);
+        }
+      }
+    }
+    paths[projection.path] = cloned;
+  }
+  delete paths[sourcePath];
 }
 
 function patchFsDownload(paths: Record<string, unknown>): void {
@@ -317,6 +486,38 @@ function jsonContent(schema: Record<string, unknown>): Record<string, unknown> {
       schema,
     },
   };
+}
+
+function requiredJsonBody(schema: Record<string, unknown>): Record<string, unknown> {
+  return {
+    required: true,
+    content: jsonContent(schema),
+  };
+}
+
+function pascalActionName(action: string): string {
+  return action
+    .split(/[^A-Za-z0-9]+/)
+    .filter((part) => part.length > 0)
+    .map((part) => `${part[0]!.toUpperCase()}${part.slice(1)}`)
+    .join('');
+}
+
+function removePathParams(container: Record<string, unknown>, names: readonly string[]): void {
+  const params = container['parameters'];
+  if (Array.isArray(params)) {
+    container['parameters'] = params.filter((param) => {
+      const record = asRecord(param);
+      return !(record?.['in'] === 'path' && names.includes(record['name'] as string));
+    });
+  }
+
+  for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
+    const operation = asRecord(container[method]);
+    if (operation !== undefined) {
+      removePathParams(operation, names);
+    }
+  }
 }
 
 function headerString(): Record<string, unknown> {

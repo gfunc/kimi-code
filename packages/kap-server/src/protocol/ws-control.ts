@@ -1,7 +1,12 @@
 import { z } from 'zod';
 
 import { isoDateTimeSchema } from '@moonshot-ai/agent-core-v2/_base/utils/isoDateTime';
-import { transcriptGradeSpecSchema, transcriptSeqSchema } from '@moonshot-ai/transcript';
+import {
+  transcriptGradeSpecSchema,
+  transcriptOpsEventSchema,
+  transcriptResetEventSchema,
+  transcriptSeqSchema,
+} from '@moonshot-ai/transcript';
 
 import { eventSchema } from './events-zod';
 
@@ -557,10 +562,47 @@ export const sessionEventOperation = {
   description: 'Session-scoped agent event envelope; frame type is the payload event type.',
 } as const satisfies WsOperationDefinition;
 
+export const transcriptStreamOperations = [
+  {
+    type: 'transcript.reset',
+    direction: 'server_to_client',
+    kind: 'event',
+    messageSchema: wsEventEnvelopeSchema(transcriptResetEventSchema),
+    description:
+      'Full transcript snapshot for one agent, sent on subscribe, grade change, or roster growth.',
+  },
+  {
+    type: 'transcript.ops',
+    direction: 'server_to_client',
+    kind: 'event',
+    messageSchema: wsEventEnvelopeSchema(transcriptOpsEventSchema),
+    description: 'Batched transcript operations for one agent since the last delivered sequence.',
+  },
+] as const satisfies readonly WsOperationDefinition[];
+
+export const terminalStreamOperations = [
+  {
+    type: 'terminal_output',
+    direction: 'server_to_client',
+    kind: 'event',
+    messageSchema: terminalOutputMessageSchema,
+    description: 'Streamed output bytes for a terminal this connection attached to.',
+  },
+  {
+    type: 'terminal_exit',
+    direction: 'server_to_client',
+    kind: 'event',
+    messageSchema: terminalExitMessageSchema,
+    description: 'Signals that a terminal process has exited.',
+  },
+] as const satisfies readonly WsOperationDefinition[];
+
 export const wsOperations = [
   ...clientControlOperations,
   ...serverSystemOperations,
   sessionEventOperation,
+  ...transcriptStreamOperations,
+  ...terminalStreamOperations,
 ] as const satisfies readonly WsOperationDefinition[];
 
 export function getClientControlOperation(

@@ -334,7 +334,7 @@ exports[`API surface snapshot > matches the documented v2 route table and meta e
     ],
     [
       "POST",
-      "/api/v1/capabilities/{tail}",
+      "/api/v1/capabilities/{capability_id}:install",
     ],
     [
       "POST",
@@ -378,11 +378,11 @@ exports[`API surface snapshot > matches the documented v2 route table and meta e
     ],
     [
       "POST",
-      "/api/v1/mcp/servers/{tail}",
+      "/api/v1/mcp/servers/{server_id}:restart",
     ],
     [
       "POST",
-      "/api/v1/models/{tail}",
+      "/api/v1/models/{model_id}:set_default",
     ],
     [
       "POST",
@@ -398,7 +398,15 @@ exports[`API surface snapshot > matches the documented v2 route table and meta e
     ],
     [
       "POST",
-      "/api/v1/plugins/{tail}",
+      "/api/v1/plugins/{plugin_id}:disable",
+    ],
+    [
+      "POST",
+      "/api/v1/plugins/{plugin_id}:enable",
+    ],
+    [
+      "POST",
+      "/api/v1/plugins/{plugin_id}:remove",
     ],
     [
       "POST",
@@ -406,7 +414,19 @@ exports[`API surface snapshot > matches the documented v2 route table and meta e
     ],
     [
       "POST",
-      "/api/v1/providers{action}",
+      "/api/v1/providers:import_catalog",
+    ],
+    [
+      "POST",
+      "/api/v1/providers:import_registry",
+    ],
+    [
+      "POST",
+      "/api/v1/providers:refresh",
+    ],
+    [
+      "POST",
+      "/api/v1/providers:refresh_oauth",
     ],
     [
       "POST",
@@ -434,10 +454,6 @@ exports[`API surface snapshot > matches the documented v2 route table and meta e
     ],
     [
       "POST",
-      "/api/v1/sessions/{session_id}/{tail}",
-    ],
-    [
-      "POST",
       "/api/v1/sessions/{session_id}/approvals/{approval_id}",
     ],
     [
@@ -447,6 +463,58 @@ exports[`API surface snapshot > matches the documented v2 route table and meta e
     [
       "POST",
       "/api/v1/sessions/{session_id}/export",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:diff",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:git_status",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:grep",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:list",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:list_many",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:mkdir",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:open",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:open-in",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:read",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:reveal",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:search",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:stat",
+    ],
+    [
+      "POST",
+      "/api/v1/sessions/{session_id}/fs:stat_many",
     ],
     [
       "POST",
