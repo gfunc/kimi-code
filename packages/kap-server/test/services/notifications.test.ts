@@ -33,7 +33,11 @@ import {
   type InteractionSource,
   type SessionSource,
 } from '../../src/services/notifications/notificationsService';
-import type { NtfyClient, NtfyPublishOptions } from '../../src/services/notifications/ntfyClient';
+import {
+  createHttpNtfyClient,
+  type NtfyClient,
+  type NtfyPublishOptions,
+} from '../../src/services/notifications/ntfyClient';
 
 class FakeNtfyClient {
   readonly published: NtfyPublishOptions[] = [];
@@ -382,14 +386,14 @@ describe('NotificationsService', () => {
     expect(approval.click).toBe('kimi://session/s1/approval/a1');
   });
 
-  it('dismisses notifications with ntfy clear semantics on resolution', async () => {
+  it('publishes a dismissal marker on resolution without a clear field', async () => {
     const harness = await startHarness();
     harness.sessions.add(harness.session);
     harness.interactions.enqueue(interaction('a1', 'approval', 's1', {}));
     harness.interactions.respond('a1', { decision: 'approved', scope: 'session' });
 
     const resolution = harness.client.published.at(-1)!;
-    expect(resolution.clear).toBe(true);
+    expect(resolution).not.toHaveProperty('clear');
     expect(resolution.message).toContain('a1');
     expect(resolution.priority).toBe(1);
   });
@@ -436,6 +440,21 @@ describe('NotificationsService', () => {
     ]);
   });
 
+  it('publishes the dismissal marker even when min_priority filters its priority', async () => {
+    const harness = await startHarness({ config: { minPriority: 4 } });
+    harness.sessions.add(harness.session);
+    harness.service.onRemoteControlStatus('relay_disconnected');
+    harness.interactions.enqueue(interaction('a1', 'approval', 's1', {}));
+    harness.interactions.respond('a1', { decision: 'approved', scope: 'session' });
+
+    expect(harness.client.published.map((message) => message.title)).toEqual([
+      'Approval requested',
+      'Resolved',
+    ]);
+    const resolution = harness.client.published.at(-1)!;
+    expect(resolution.priority).toBe(1);
+  });
+
   it('drops events excluded by the events filter', async () => {
     const harness = await startHarness({
       config: { events: ['approval.requested', 'question.requested'] },
@@ -477,5 +496,34 @@ describe('NotificationsService', () => {
     harness.interactions.enqueue(interaction('a1', 'approval', 's1', {}));
 
     expect(harness.client.published).toEqual([]);
+  });
+});
+
+describe('createHttpNtfyClient', () => {
+  it('omits the clear key from the published body', async () => {
+    const bodies: string[] = [];
+    const client = createHttpNtfyClient({
+      baseUrl: 'https://ntfy.example.test',
+      fetch: async (_input, init) => {
+        const request = new Request('https://ntfy.example.test/', init);
+        bodies.push(await request.text());
+        return new Response(null, { status: 200 });
+      },
+    });
+    const interactions = new FakeInteractions();
+    const service = new NotificationsService({
+      client,
+      sources: { interactions, sessions: new FakeSessions() },
+    });
+    await service.start(makeCore(makeConfig(), true));
+    interactions.enqueue(interaction('a1', 'approval', 's1', {}));
+    interactions.respond('a1', { decision: 'approved', scope: 'session' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).not.toContain('clear');
+    const parsed = JSON.parse(bodies[1]!) as Record<string, unknown>;
+    expect(parsed).not.toHaveProperty('clear');
+    expect(parsed['priority']).toBe(1);
   });
 });

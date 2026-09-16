@@ -5,7 +5,6 @@ export interface NtfyPublishOptions {
   readonly priority?: number;
   readonly tags?: readonly string[];
   readonly click?: string;
-  readonly clear?: boolean;
 }
 
 export interface NtfyClient {
@@ -37,7 +36,6 @@ export function createHttpNtfyClient(options: HttpNtfyClientOptions): NtfyClient
           priority: message.priority,
           tags: message.tags,
           click: message.click,
-          clear: message.clear === true ? true : undefined,
         }),
       });
       if (!response.ok) {

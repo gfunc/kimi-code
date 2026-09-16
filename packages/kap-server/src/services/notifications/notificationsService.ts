@@ -230,7 +230,7 @@ export class NotificationsService {
         message: `interaction resolved - session ${known.sessionId ?? 'unknown'} - ${id}`,
         tags: ['white_check_mark'],
       },
-      { clear: true },
+      true,
     );
   }
 
@@ -304,11 +304,11 @@ export class NotificationsService {
     event: NotificationEvent,
     priority: number,
     message: Omit<NtfyPublishOptions, 'topic' | 'priority'>,
-    extras?: { clear?: boolean },
+    control = false,
   ): void {
     if (!this.active || this.config === undefined || this.client === undefined) return;
     if (!this.config.events.includes(event)) return;
-    if (priority < this.config.minPriority) return;
+    if (!control && priority < this.config.minPriority) return;
     const topic = this.config.topic;
     if (topic === undefined) return;
     void this.client
@@ -319,7 +319,6 @@ export class NotificationsService {
         title: message.title,
         tags: message.tags,
         click: message.click,
-        clear: extras?.clear,
       })
       .catch((error: unknown) => {
         this.opts.logger?.warn(
