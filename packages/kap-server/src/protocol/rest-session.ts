@@ -172,6 +172,14 @@ export const sessionAbortResponseSchema = z.object({
 });
 export type SessionAbortResponse = z.infer<typeof sessionAbortResponseSchema>;
 
+export const abortSessionRequestSchema = z.preprocess(
+  (value) => (value === undefined ? {} : value),
+  z.object({
+    agent_id: z.string().min(1).optional(),
+  }),
+);
+export type AbortSessionRequest = z.infer<typeof abortSessionRequestSchema>;
+
 function fitsUtf8ByteLimit(value: string, limit: number): boolean {
   let bytes = 0;
   for (let index = 0; index < value.length; index += 1) {

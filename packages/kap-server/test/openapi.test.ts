@@ -53,6 +53,15 @@ describe('server-v2 OpenAPI', () => {
     const deleteParams = deleteOp['parameters'] as Array<Record<string, unknown>>;
     expect(deleteParams.some((p) => p['in'] === 'path' && p['name'] === 'session_id')).toBe(true);
     expect(deleteParams.some((p) => p['name'] === 'tail')).toBe(false);
+
+    const archiveBody = asRecord(archiveOp['requestBody']);
+    const archiveSchema = asRecord(
+      asRecord(asRecord(archiveBody['content'])['application/json'])['schema'],
+    );
+    const archiveProperties = asRecord(archiveSchema['properties']);
+    expect(archiveProperties['agent_id'], 'abort agent_id body field').toMatchObject({
+      type: 'string',
+    });
   });
 
   it('describes the file upload as multipart/form-data', async () => {

@@ -22,6 +22,7 @@ import {
   IAgentConversationUndoService,
   IAgentCronService,
   IAgentLifecycleService,
+  IAgentLoopService,
   IEventBus,
   IEventService,
   ISessionManager,
@@ -956,6 +957,40 @@ describe('server-v2 /api/v1/sessions', () => {
   it('returns 40401 when restoring a missing session', async () => {
     const { body } = await postJson<null>('/api/v1/sessions/sess_missing:restore');
     expect(body.code).toBe(40401);
+  });
+
+  it('aborts a side agent via agent_id and keeps the main default when absent', async () => {
+    const cwd = home as string;
+    const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd } });
+    const id = created.body.data.id;
+    const session = await resumeSessionById((server as RunningServer).core.accessor, id);
+    if (session === undefined) throw new Error(`session ${id} not live`);
+    const lifecycle = session.accessor.get(IAgentLifecycleService);
+    await lifecycle.create({ agentId: MAIN_AGENT_ID });
+    await lifecycle.create({ agentId: 'agent-9', forkedFrom: MAIN_AGENT_ID });
+    const mainLoop = lifecycle.handleOf(MAIN_AGENT_ID)!.accessor.get(IAgentLoopService);
+    const sideLoop = lifecycle.handleOf('agent-9')!.accessor.get(IAgentLoopService);
+    const mainCancel = vi.spyOn(mainLoop, 'cancel');
+    const sideCancel = vi.spyOn(sideLoop, 'cancel');
+
+    const sideAbort = await postJson<{ aborted: boolean }>(`/api/v1/sessions/${id}:abort`, {
+      agent_id: 'agent-9',
+    });
+    expect(sideAbort.body.code).toBe(0);
+    expect(sideAbort.body.data).toEqual({ aborted: true });
+    expect(sideCancel).toHaveBeenCalledTimes(1);
+    expect(mainCancel).not.toHaveBeenCalled();
+
+    const mainAbort = await postJson<{ aborted: boolean }>(`/api/v1/sessions/${id}:abort`);
+    expect(mainAbort.body.code).toBe(0);
+    expect(mainAbort.body.data).toEqual({ aborted: true });
+    expect(mainCancel).toHaveBeenCalledTimes(1);
+    expect(sideCancel).toHaveBeenCalledTimes(1);
+
+    const unknown = await postJson<null>(`/api/v1/sessions/${id}:abort`, {
+      agent_id: 'agent-missing',
+    });
+    expect(unknown.body.code).toBe(40401);
   });
 
   it('deletes a session via :delete and publishes event.session.deleted', async () => {

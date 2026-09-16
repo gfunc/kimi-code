@@ -37,6 +37,7 @@ import { pageResponseSchema } from '../protocol/pagination';
 import { toProtocolMessage } from '../services/messages/messageProjection';
 import {
   archiveSessionResponseSchema,
+  abortSessionRequestSchema,
   compactSessionRequestSchema,
   compactSessionResponseSchema,
   createSessionChildRequestSchema,
@@ -162,6 +163,7 @@ const sessionActionRequestSchema = z.preprocess(
     instruction: z.string().optional(),
     count: z.number().int().positive().optional(),
     page_size: z.number().int().min(1).max(100).optional(),
+    agent_id: z.string().min(1).optional(),
   }),
 );
 
@@ -881,7 +883,7 @@ const sessionActions: ActionTable<SessionAction, SessionActionExtra> = {
   fork: { body: forkSessionRequestSchema, handle: forkSessionAction },
   compact: { body: compactSessionRequestSchema, handle: compactSessionAction },
   undo: { body: undoSessionRequestSchema, handle: undoSessionAction },
-  abort: { handle: abortSessionAction },
+  abort: { body: abortSessionRequestSchema, handle: abortSessionAction },
   btw: { handle: btwSessionAction },
   restore: { handle: restoreSessionAction },
   archive: { handle: archiveSessionAction },
@@ -952,11 +954,19 @@ async function undoSessionAction(
   );
 }
 
-async function abortSessionAction(ctx: SessionActionCtx): Promise<void> {
-  const { core, req, reply, id } = ctx;
-  const agent = await resolveMainAgent(core, id);
+async function abortSessionAction(
+  ctx: SessionActionCtx<z.infer<typeof abortSessionRequestSchema>>,
+): Promise<void> {
+  const { core, req, reply, id, body } = ctx;
+  const agent =
+    body.agent_id === undefined || body.agent_id === MAIN_AGENT_ID
+      ? await resolveMainAgent(core, id)
+      : await resolveSessionAgent(core, id, body.agent_id);
   agent.accessor.get(IAgentLoopService).cancel();
-  requestLog(req)?.info({ session_id: id, action: 'abort' }, 'session action completed');
+  requestLog(req)?.info(
+    { session_id: id, agent_id: body.agent_id ?? MAIN_AGENT_ID, action: 'abort' },
+    'session action completed',
+  );
   reply.send(okEnvelope({ aborted: true }, req.id));
 }
 
@@ -1089,6 +1099,22 @@ async function resolveMainAgent(core: Scope, sessionId: string): Promise<IAgentS
     throw new Error2(ErrorCodes.SESSION_NOT_FOUND, `session ${sessionId} does not exist`);
   }
   return ensureMainAgent(session);
+}
+
+async function resolveSessionAgent(
+  core: Scope,
+  sessionId: string,
+  agentId: string,
+): Promise<IAgentScopeHandle> {
+  const session = await resumeSessionById(core.accessor, sessionId);
+  if (session === undefined) {
+    throw new Error2(ErrorCodes.SESSION_NOT_FOUND, `session ${sessionId} does not exist`);
+  }
+  const agent = session.accessor.get(IAgentLifecycleService).handleOf(agentId);
+  if (agent === undefined) {
+    throw new Error2(ErrorCodes.AGENT_NOT_FOUND, `agent ${agentId} does not exist`);
+  }
+  return agent;
 }
 
 function normalizeOptional(value: string | undefined): string | undefined {
