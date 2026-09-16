@@ -40,6 +40,7 @@ import {
 } from '@moonshot-ai/transcript';
 
 import { readWireRecords, type ContextRecord } from './wireRecords';
+import { isForkedAgent, stripForkedInheritedMessages } from '../projection/heal';
 import { toWireQuestion } from '../../protocol/question-wire';
 import { projectPromptContentParts } from '../messages/messageProjection';
 import {
@@ -469,6 +470,9 @@ export class TranscriptService {
         return groupMessagesIntoSnapshot([]);
       }
       throw error;
+    }
+    if (await isForkedAgent(this.deps.core, this.deps.homeDir, sessionId, agentId, summary.workspaceId)) {
+      records = stripForkedInheritedMessages(records);
     }
     const messages = [...reduceContextTranscript(records).entries];
     const taskOriginTurnTaskIds = new Set<string>();

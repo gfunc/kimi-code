@@ -106,6 +106,59 @@ const SUB_WIRE = [
   rec('turn.ended', { turnId: 0, reason: 'completed' }, T0 + 24),
 ];
 
+const BTW_WIRE = [
+  rec('context.append_message', {
+    message: {
+      id: 'p0',
+      role: 'user',
+      content: [{ type: 'text', text: 'hello world' }],
+      toolCalls: [],
+      origin: { kind: 'user' },
+    },
+  }, T0 + 30),
+  rec('context.append_message', {
+    message: {
+      role: 'assistant',
+      content: [],
+      toolCalls: [{ type: 'function', id: 'call_1', name: 'Bash', arguments: '{"command":"ls"}' }],
+    },
+  }, T0 + 31),
+  rec('context.append_message', {
+    message: {
+      role: 'tool',
+      toolCallId: 'call_1',
+      content: [{ type: 'text', text: 'file.txt' }],
+      toolCalls: [],
+    },
+  }, T0 + 32),
+  rec('context.append_message', {
+    message: {
+      role: 'user',
+      content: [{ type: 'text', text: 'side-channel reminder' }],
+      toolCalls: [],
+      origin: { kind: 'injection', variant: 'btw' },
+    },
+  }, T0 + 33),
+  rec('turn.prompt', {
+    input: [{ type: 'text', text: 'btw: what does this repo do?' }],
+    origin: { kind: 'user' },
+    promptId: 'p9',
+  }, T0 + 34),
+  rec('context.append_message', {
+    message: {
+      id: 'p9',
+      role: 'user',
+      content: [{ type: 'text', text: 'btw: what does this repo do?' }],
+      toolCalls: [],
+      origin: { kind: 'user' },
+    },
+  }, T0 + 35),
+  loopEvent({ type: 'step.begin', uuid: 'u9', turnId: '0', step: 1 }, T0 + 36),
+  loopEvent({ type: 'content.part', stepUuid: 'u9', part: { type: 'text', text: 'side answer' } }, T0 + 37),
+  loopEvent({ type: 'step.end', uuid: 'u9', finishReason: 'stop' }, T0 + 38),
+  rec('turn.ended', { turnId: 0, reason: 'completed' }, T0 + 39),
+];
+
 describe('server /api/v1/sessions/{sid}/history', () => {
   let server: RunningServer | undefined;
   let home: string | undefined;
@@ -336,6 +389,59 @@ describe('server /api/v1/sessions/{sid}/history', () => {
       agent_id: 'sub-1',
     });
     expect(main.body.data.messages.map(entityId)).toContain('t1');
+  });
+
+  it('reads a forked side-agent timeline without replaying the inherited parent context', async () => {
+    const id = await createSession();
+    await writeWire(id, 'main', MAIN_WIRE);
+    await writeWire(id, 'agent-0', BTW_WIRE);
+    const workspaceId = await workspaceIdOf(id);
+    await writeFile(
+      join(home as string, 'sessions', workspaceId, id, 'state.json'),
+      JSON.stringify({
+        id,
+        version: 2,
+        createdAt: T0,
+        updatedAt: T0,
+        archived: false,
+        title: 'forked session',
+        agents: {
+          main: { type: 'main' },
+          'agent-0': { type: 'sub', parentAgentId: 'main', forkedFrom: 'main' },
+        },
+      }),
+      'utf8',
+    );
+    await reboot();
+
+    const side = await getJson<HistoryWire>(`/api/v1/sessions/${id}/history?agent_id=agent-0`);
+    expect(side.body.code).toBe(0);
+    expect(side.body.data.messages.map(entityId)).toEqual(['t0', 'p9', 't0.1', 't0.1.a1']);
+    const turn = side.body.data.messages[0]!;
+    expect(turn).toMatchObject({
+      type: 'turn',
+      turn_id: 't0',
+      agent_id: 'agent-0',
+      origin: { kind: 'user' },
+      user_message_id: 'p9',
+    });
+    const answer = side.body.data.messages.find((m) => m['message_id'] === 't0.1.a1')!;
+    expect(answer).toMatchObject({ type: 'assistant', text: 'side answer' });
+
+    const main = await getJson<HistoryWire>(`/api/v1/sessions/${id}/history?agent_id=main`);
+    expect(main.body.code).toBe(0);
+    expect(main.body.data.messages.map(entityId)).toEqual([
+      't0',
+      'p0',
+      't0.1',
+      't0.1.a1',
+      'call_1',
+      'task-2',
+      't1',
+      'p1',
+      't1.1',
+      't1.1.a1',
+    ]);
   });
 
   it('marks the in-flight position for a live session once a turn is streaming', async () => {

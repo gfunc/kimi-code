@@ -9,7 +9,7 @@ import {
 import { AgentMessageProjector } from '../../src/services/projection/agentProjector';
 import type { ProjectionBusEvent } from '../../src/services/projection/events';
 import type { ContextRecord } from '../../src/services/projection/heal';
-import { foldTimelineSeed } from '../../src/services/projection/heal';
+import { foldTimelineSeed, stripForkedInheritedMessages } from '../../src/services/projection/heal';
 import { foldWireHistory, paginateHistory, type ColdFoldOptions } from '../../src/services/history';
 
 const SESSION = 's1';
@@ -1442,5 +1442,45 @@ describe('live and cold rebuild id consistency', () => {
       .map((m) => (m.type === 'turn' ? m.turn_id : m.system_id));
     expect(legacySeed.timelineIds).toEqual(legacyColdIds);
     expect(legacySeed.nextTurnId).toBe(2);
+  });
+
+  it('foldTimelineSeed sees only the forked agent own records after stripping the inherited block', () => {
+    const forked: ContextRecord[] = [
+      rec('context.append_message', {
+        message: {
+          id: 'p0',
+          role: 'user',
+          content: [{ type: 'text', text: 'hello world' }],
+          toolCalls: [],
+          origin: { kind: 'user' },
+        },
+      }, T0),
+      rec('context.append_message', {
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Hi there' }],
+          toolCalls: [],
+        },
+      }, T0 + 1),
+      rec('context.append_message', {
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'side-channel reminder' }],
+          toolCalls: [],
+          origin: { kind: 'injection', variant: 'btw' },
+        },
+      }, T0 + 2),
+      rec('turn.prompt', {
+        input: [{ type: 'text', text: 'btw: what does this repo do?' }],
+        origin: { kind: 'user' },
+        promptId: 'p9',
+      }, T0 + 3),
+    ];
+    expect(foldTimelineSeed(forked).timelineIds).toEqual(['t0', 't1']);
+    const stripped = stripForkedInheritedMessages(forked);
+    expect(stripped.filter((record) => record.type === 'context.append_message')).toHaveLength(0);
+    const seed = foldTimelineSeed(stripped);
+    expect(seed.timelineIds).toEqual(['t0']);
+    expect(seed.nextTurnId).toBe(1);
   });
 });

@@ -34,7 +34,7 @@ import { readLegacyStatus } from '../legacyStatus/legacyStatus';
 import { AgentStateTracker } from './agentState';
 import { AgentMessageProjector, toTurnOrigin, type ProjectorInteraction } from './agentProjector';
 import type { ProjectionBusEvent } from './events';
-import { foldTimelineSeed, foldWireTurn, readWireRecords, type ContextRecord } from './heal';
+import { foldTimelineSeed, foldWireTurn, readWireRecords, stripForkedInheritedMessages, type ContextRecord } from './heal';
 import { isUndoAnchorOrigin } from './ids';
 import { SessionStateAggregator } from './sessionState';
 
@@ -604,7 +604,8 @@ export class SessionProjection {
     if (index === undefined) return undefined;
     const summary = await index.get(this.sessionId);
     if (summary === undefined) return undefined;
-    const wire = this.agentHandle(agentId)?.accessor.get(IWireService);
+    const handle = this.agentHandle(agentId);
+    const wire = handle?.accessor.get(IWireService);
     if (wire !== undefined) {
       try {
         await wire.flush();
@@ -620,7 +621,7 @@ export class SessionProjection {
       }
     }
     try {
-      return await readWireRecords(
+      const records = await readWireRecords(
         join(
           this.deps.homeDir,
           'sessions',
@@ -631,6 +632,8 @@ export class SessionProjection {
           'wire.jsonl',
         ),
       );
+      if (handle?.accessor.get(IAgentScopeContext)?.forkedFrom === undefined) return records;
+      return stripForkedInheritedMessages(records);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       this.deps.logger?.warn(

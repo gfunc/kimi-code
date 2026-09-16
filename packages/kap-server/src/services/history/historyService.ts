@@ -14,7 +14,7 @@ import {
   type HistoryMessage,
   type HistoryResponse,
 } from '../../protocol/messages';
-import { readWireRecords, type ContextRecord } from '../projection/heal';
+import { readWireRecords, isForkedAgent, stripForkedInheritedMessages, type ContextRecord } from '../projection/heal';
 import type { ProjectionService } from '../projection/projectionService';
 import { foldWireHistory } from './coldFold';
 
@@ -53,12 +53,15 @@ export async function readSessionHistory(
   const agentId = query.agent_id ?? MAIN_AGENT_ID;
   const live = getLiveSessionById(deps.core.accessor, sessionId) !== undefined;
   if (live) await flushAgentWire(deps.core, sessionId, agentId);
-  const records = await readAgentWire(deps.homeDir, summary.workspaceId, sessionId, agentId);
+  let records = await readAgentWire(deps.homeDir, summary.workspaceId, sessionId, agentId);
   let subagentTaskIds: ReadonlyMap<string, string> | undefined;
   if (agentId !== MAIN_AGENT_ID) {
     if (live) await flushAgentWire(deps.core, sessionId, MAIN_AGENT_ID);
     const mainRecords = await readAgentWire(deps.homeDir, summary.workspaceId, sessionId, MAIN_AGENT_ID);
     subagentTaskIds = scanSubagentTaskIds(mainRecords);
+  }
+  if (await isForkedAgent(deps.core, deps.homeDir, sessionId, agentId, summary.workspaceId)) {
+    records = stripForkedInheritedMessages(records);
   }
   const all = foldWireHistory(records, {
     sessionId,

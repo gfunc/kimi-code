@@ -1,6 +1,13 @@
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
-import type { TokenUsage } from '@moonshot-ai/agent-core-v2';
+import {
+  getLiveSessionById,
+  IAgentLifecycleService,
+  IAgentScopeContext,
+  type Scope,
+  type TokenUsage,
+} from '@moonshot-ai/agent-core-v2';
 
 import type { StepTiming, StepUsage } from '../../protocol/messages';
 import {
@@ -35,6 +42,39 @@ export async function readWireRecords(wirePath: string): Promise<ContextRecord[]
     }
   }
   return records;
+}
+
+export async function isForkedAgent(
+  core: Scope,
+  homeDir: string,
+  sessionId: string,
+  agentId: string,
+  workspaceId: string,
+): Promise<boolean> {
+  const handle = getLiveSessionById(core.accessor, sessionId)
+    ?.accessor.get(IAgentLifecycleService)
+    .handleOf(agentId);
+  if (handle !== undefined) {
+    return handle.accessor.get(IAgentScopeContext)?.forkedFrom !== undefined;
+  }
+  try {
+    const raw = await readFile(
+      join(homeDir, 'sessions', workspaceId, sessionId, 'state.json'),
+      'utf8',
+    );
+    const meta = JSON.parse(raw) as { agents?: Record<string, { forkedFrom?: unknown }> };
+    return typeof meta.agents?.[agentId]?.forkedFrom === 'string';
+  } catch {
+    return false;
+  }
+}
+
+export function stripForkedInheritedMessages(records: readonly ContextRecord[]): ContextRecord[] {
+  const firstOwn = records.findIndex((record) => record.type === 'turn.prompt');
+  const cut = firstOwn === -1 ? records.length : firstOwn;
+  return records.filter(
+    (record, index) => record.type !== 'context.append_message' || index >= cut,
+  );
 }
 
 export interface TimelineSeed {

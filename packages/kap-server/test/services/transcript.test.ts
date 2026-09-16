@@ -2644,6 +2644,56 @@ describe('AgentTranscriptProjector', () => {
     }
   });
 
+  it('readColdSnapshot drops the inherited parent context for a forked agent', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'transcript-cold-forked-'));
+    try {
+      const sessionDir = join(home, 'sessions', 'ws', 's1');
+      const sideDir = join(sessionDir, 'agents', 'agent-0');
+      await mkdir(sideDir, { recursive: true });
+      const records = [
+        { type: 'context.append_message', message: { id: 'p0', role: 'user', content: [{ type: 'text', text: 'hello world' }], toolCalls: [], origin: { kind: 'user' } }, time: 1000 },
+        { type: 'context.append_message', message: { role: 'assistant', content: [], toolCalls: [{ type: 'function', id: 'call_1', name: 'Bash', arguments: '{"command":"ls"}' }] }, time: 2000 },
+        { type: 'context.append_message', message: { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: 'file.txt' }], toolCalls: [] }, time: 3000 },
+        { type: 'context.append_message', message: { role: 'user', content: [{ type: 'text', text: 'side-channel reminder' }], toolCalls: [], origin: { kind: 'injection', variant: 'btw' } }, time: 4000 },
+        { type: 'turn.prompt', input: [{ type: 'text', text: 'btw: what does this repo do?' }], origin: { kind: 'user' }, promptId: 'p9', time: 5000 },
+        { type: 'context.append_message', message: { id: 'p9', role: 'user', content: [{ type: 'text', text: 'btw: what does this repo do?' }], toolCalls: [], origin: { kind: 'user' } }, time: 5001 },
+        { type: 'context.append_loop_event', event: { type: 'step.begin', uuid: 'u9', turnId: '0', step: 1 }, time: 5002 },
+        { type: 'context.append_loop_event', event: { type: 'content.part', stepUuid: 'u9', part: { type: 'text', text: 'side answer' } }, time: 5003 },
+        { type: 'context.append_loop_event', event: { type: 'step.end', uuid: 'u9', finishReason: 'stop' }, time: 5004 },
+        { type: 'turn.ended', turnId: 0, reason: 'completed', time: 5005 },
+      ];
+      await writeFile(join(sideDir, 'wire.jsonl'), `${records.map((r) => JSON.stringify(r)).join('\n')}\n`);
+      const writeState = async (agents: Record<string, unknown>): Promise<void> =>
+        writeFile(
+          join(sessionDir, 'state.json'),
+          JSON.stringify({ id: 's1', createdAt: 1, updatedAt: 1, archived: false, agents }),
+        );
+
+      await writeState({ 'agent-0': { type: 'sub', parentAgentId: 'main', forkedFrom: 'main' } });
+      const forked = await coldTranscriptService(home).readColdSnapshot('s1', 'agent-0');
+      const forkedTurns = forked!.items.filter((item) => item.kind === 'turn');
+      expect(forkedTurns.map((item) => (item.kind === 'turn' ? item.turnId : ''))).toEqual(['t0']);
+      const forkedTurn = forkedTurns[0];
+      if (forkedTurn?.kind !== 'turn') throw new Error('expected turn');
+      expect(forkedTurn).toMatchObject({
+        prompt: 'btw: what does this repo do?',
+        triggerPromptId: 'p9',
+      });
+      expect(
+        forkedTurn.steps.flatMap((step) => step.frames).some(
+          (frame) => frame.kind === 'text' && frame.role === 'assistant' && frame.text === 'side answer',
+        ),
+      ).toBe(true);
+
+      await writeState({ 'agent-0': { type: 'sub', parentAgentId: 'main' } });
+      const plain = await coldTranscriptService(home).readColdSnapshot('s1', 'agent-0');
+      const plainTurns = plain!.items.filter((item) => item.kind === 'turn');
+      expect(plainTurns).toHaveLength(2);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it('readColdSnapshot opens a task-origin turn only when the wire has the turn.prompt boundary', async () => {
     const home = await mkdtemp(join(tmpdir(), 'transcript-cold-taskturn-'));
     try {
@@ -3112,12 +3162,13 @@ describe('bindSessionTranscript', () => {
       this.closeHandlers.add(cb);
       return { dispose: () => this.closeHandlers.delete(cb) };
     }
-    add(id: string, opts?: { loopStatus?: { state?: 'idle' | 'running'; activeTurnId?: number }; tasks?: readonly unknown[]; activePromptId?: string }): FakeAgentHandle {
+    add(id: string, opts?: { loopStatus?: { state?: 'idle' | 'running'; activeTurnId?: number }; tasks?: readonly unknown[]; activePromptId?: string; forkedFrom?: string }): FakeAgentHandle {
       const bus = this.handles.get(id)?.bus ?? new FakeBus();
       const scope = makeAgentScopeContext({
         agentId: id,
         agentScope: `agents/${id}`,
         generation: 1,
+        forkedFrom: opts?.forkedFrom,
       });
       let activity: AgentActivitySnapshot = {};
       bus.subscribe((event) => {
@@ -3342,6 +3393,62 @@ describe('bindSessionTranscript', () => {
         time: new Date().toISOString(),
       });
     }
+    await writeFile(join(wireDir, 'wire.jsonl'), `${records.map((r) => JSON.stringify(r)).join('\n')}\n`);
+    return home;
+  }
+
+  async function seedForkedWireHome(): Promise<string> {
+    const home = await mkdtemp(join(tmpdir(), 'transcript-forked-overlay-'));
+    const wireDir = join(home, 'sessions', 'ws', 's1', 'agents', 'agent-0');
+    await mkdir(wireDir, { recursive: true });
+    const records: Record<string, unknown>[] = [
+      {
+        type: 'context.append_message',
+        message: {
+          id: 'p0',
+          role: 'user',
+          content: [{ type: 'text', text: 'hello world' }],
+          toolCalls: [],
+          origin: { kind: 'user' },
+        },
+        time: 1000,
+      },
+      {
+        type: 'context.append_message',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Hi there' }],
+          toolCalls: [{ type: 'function', id: 'call_1', name: 'Bash', arguments: '{"command":"ls"}' }],
+        },
+        time: 2000,
+      },
+      {
+        type: 'context.append_message',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'side-channel reminder' }],
+          toolCalls: [],
+          origin: { kind: 'injection', variant: 'btw' },
+        },
+        time: 3000,
+      },
+      { type: 'turn.prompt', input: [{ type: 'text', text: 'btw: what does this repo do?' }], origin: { kind: 'user' }, promptId: 'p9', time: 4000 },
+      {
+        type: 'context.append_message',
+        message: {
+          id: 'p9',
+          role: 'user',
+          content: [{ type: 'text', text: 'btw: what does this repo do?' }],
+          toolCalls: [],
+          origin: { kind: 'user' },
+        },
+        time: 4001,
+      },
+      { type: 'context.append_loop_event', event: { type: 'step.begin', uuid: 'u9', turnId: '0', step: 1 }, time: 4002 },
+      { type: 'context.append_loop_event', event: { type: 'content.part', stepUuid: 'u9', part: { type: 'text', text: 'side answer' } }, time: 4003 },
+      { type: 'context.append_loop_event', event: { type: 'step.end', uuid: 'u9', finishReason: 'stop' }, time: 4004 },
+      { type: 'turn.ended', turnId: 0, reason: 'completed', time: 4005 },
+    ];
     await writeFile(join(wireDir, 'wire.jsonl'), `${records.map((r) => JSON.stringify(r)).join('\n')}\n`);
     return home;
   }
@@ -3754,6 +3861,38 @@ describe('bindSessionTranscript', () => {
         triggerPromptId: 'prompt-1',
         prompt: 'hi',
       });
+      service.dropSession('s1');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('backfills a live forked agent without replaying the inherited parent context', async () => {
+    const home = await seedForkedWireHome();
+    try {
+      const agents = new FakeAgents();
+      agents.add('agent-0', { forkedFrom: 'main' });
+      const service = new TranscriptService({
+        homeDir: home,
+        core: fakeCoreWithAgents(agents),
+      });
+      const store = service.forSessionLive('s1');
+      await service.ensureAgentHistory('s1', 'agent-0');
+      const transcript = store?.getAgent('agent-0');
+      const turns = (transcript?.getItems() ?? []).filter(
+        (item): item is TranscriptTurn => item.kind === 'turn',
+      );
+      expect(turns.map((turn) => turn.turnId)).toEqual(['t0']);
+      expect(turns[0]).toMatchObject({
+        prompt: 'btw: what does this repo do?',
+        triggerPromptId: 'p9',
+      });
+      expect(
+        turns[0]!.steps
+          .flatMap((step) => step.frames)
+          .some((frame) => frame.kind === 'text' && frame.role === 'assistant' && frame.text === 'side answer'),
+      ).toBe(true);
+      expect(store?.agents().map((descriptor) => descriptor.agentId)).toContain('agent-0');
       service.dropSession('s1');
     } finally {
       await rm(home, { recursive: true, force: true });
