@@ -36,6 +36,7 @@ export const sessionAgentConfigSchema = z.object({
   thinking: promptThinkingSchema.optional(),
   permission_mode: promptPermissionModeSchema.optional(),
   plan_mode: z.boolean().optional(),
+  plan_control: z.enum(['clear']).optional(),
   swarm_mode: z.boolean().optional(),
   tower_mode: z.boolean().optional(),
   tower_base: z.string().min(1).optional(),

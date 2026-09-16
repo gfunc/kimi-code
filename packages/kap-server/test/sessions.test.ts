@@ -19,6 +19,7 @@ import {
   type IOAuthService as IOAuthServiceType,
   IAgentContextMemoryService,
   IAgentGoalService,
+  IAgentPlanService,
   IAgentConversationUndoService,
   IAgentCronService,
   IAgentLifecycleService,
@@ -42,6 +43,7 @@ import { sessionWarningsResponseSchema } from '@moonshot-ai/agent-core-v2/app/se
 import { encodeWorkDirKey } from '@moonshot-ai/agent-core-v2/_base/utils/workdir-slug';
 
 import { type RunningServer, startServer } from '../src/start';
+import { ensureMainAgent } from '../src/transport/mainAgent';
 import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
 import { authHeaders } from './helpers/auth';
 
@@ -799,6 +801,46 @@ describe('server-v2 /api/v1/sessions', () => {
     expect(after.body.data.plan_mode).toBe(true);
     expect(after.body.data.swarm_mode).toBe(true);
     expect(after.body.data.permission).toBe('yolo');
+  });
+
+  it('clears the active plan content via plan_control agent_config', async () => {
+    const cwd = home as string;
+    const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd } });
+    const id = created.body.data.id;
+
+    await postJson(`/api/v1/sessions/${id}/profile`, { agent_config: { plan_mode: true } });
+
+    const session = await resumeSessionById((server as RunningServer).core.accessor, id);
+    const agent = await ensureMainAgent(session!);
+    const plan = agent.accessor.get(IAgentPlanService);
+    const active = await plan.status();
+    expect(active).not.toBeNull();
+    await writeFile(active!.path, '# original plan');
+
+    const cleared = await postJson(`/api/v1/sessions/${id}/profile`, {
+      agent_config: { plan_control: 'clear' },
+    });
+    expect(cleared.body.code).toBe(0);
+
+    const after = await plan.status();
+    expect(after?.content).toBe('');
+    expect(await readFile(after!.path, 'utf8')).toBe('');
+    const status = await getJson<{ plan_mode: boolean }>(`/api/v1/sessions/${id}/status`);
+    expect(status.body.data.plan_mode).toBe(true);
+  });
+
+  it('treats plan_control clear as a no-op outside plan mode', async () => {
+    const cwd = home as string;
+    const created = await postJson<SessionWire>('/api/v1/sessions', { metadata: { cwd } });
+    const id = created.body.data.id;
+
+    const cleared = await postJson(`/api/v1/sessions/${id}/profile`, {
+      agent_config: { plan_control: 'clear' },
+    });
+
+    expect(cleared.body.code).toBe(0);
+    const status = await getJson<{ plan_mode: boolean }>(`/api/v1/sessions/${id}/status`);
+    expect(status.body.data.plan_mode).toBe(false);
   });
 
   it('rejects tower_mode agent_config when the tower feature is unavailable', async () => {

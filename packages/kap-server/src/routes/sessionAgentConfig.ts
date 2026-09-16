@@ -47,6 +47,9 @@ export async function applySessionAgentConfig(
       else plan.exit();
     }
   }
+  if (agentConfig.plan_control === 'clear') {
+    await agent.accessor.get(IAgentPlanService).clear();
+  }
   if (agentConfig.swarm_mode !== undefined) {
     const swarm = agent.accessor.get(IAgentSwarmService);
     if (swarm.isActive !== agentConfig.swarm_mode) {
