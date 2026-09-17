@@ -78,6 +78,7 @@ This is a TypeScript monorepo built for agent-assisted development. Keep the roo
 ## Workflow Requirements
 
 - Prefer `rg` / `rg --files` when reading code.
+- Dev subagents run **only the tests their changes affected** (specific test files / `--tests` filters, plus typecheck of touched packages) — never a full gate (full package suites, root lint sweeps) per agent. Full gates run once at the effort's wrap-up, not per change.
 - When designing changes, follow existing boundaries and local patterns first.
 - In public text and test data, replace real internal identifiers with neutral placeholders such as `example.com`, `example.test`, and `YOUR_API_KEY`. Before opening a PR, ask a read-only agent to audit the diff for context-specific internal identifiers.
 - When creating a PR, the PR title must follow Conventional Commit style, e.g. `chore: remove legacy format commands`.
