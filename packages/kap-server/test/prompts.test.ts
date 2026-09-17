@@ -1,4 +1,5 @@
 import { chmod, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { deflateSync } from 'node:zlib';
@@ -9,6 +10,7 @@ import {
   IAgentTitlePromptSource,
   IAgentContextMemoryService,
   IAgentLifecycleService,
+  IAgentLoopService,
   IAgentPermissionModeService,
   IAgentProfileService,
   IAgentStateService,
@@ -207,6 +209,34 @@ async function writeConfigToml(dir: string, content: string): Promise<void> {
   const tmpPath = join(dir, `config.toml.${process.pid}.${configTomlSeq}.tmp`);
   await writeFile(tmpPath, content, 'utf-8');
   await rename(tmpPath, join(dir, 'config.toml'));
+}
+
+function promptTomlWithLlm(llmPort: number): string {
+  return PROMPT_TOML.replace(
+    'base_url = "http://127.0.0.1:9999"',
+    `base_url = "http://127.0.0.1:${String(llmPort)}"`,
+  );
+}
+
+function sseReply(text: string): string {
+  return [
+    `data: ${JSON.stringify({
+      id: 'chatcmpl-boundary',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'stub',
+      choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }],
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      id: 'chatcmpl-boundary',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'stub',
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+    })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join('');
 }
 
 describe('server-v2 /api/v1 prompts', () => {
@@ -1631,6 +1661,67 @@ describe('server-v2 /api/v1 prompts', () => {
       `/api/v1/sessions/${id}/prompts/prompt_does_not_exist:abort`,
     );
     expect(body.code).toBe(40402);
+  });
+
+  it('accepts a steer that races the turn boundary', async () => {
+    const heldLlmRequests: Array<(text: string) => void> = [];
+    const llm = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        heldLlmRequests.push((text: string) => {
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.end(sseReply(text));
+        });
+      });
+    });
+    await new Promise<void>((resolve) => llm.listen(0, '127.0.0.1', resolve));
+    const llmPort = (llm.address() as { port: number }).port;
+    await writeConfigToml(home as string, promptTomlWithLlm(llmPort));
+    await server!.core.accessor.get(IConfigService).reload();
+
+    const id = await createSession(home as string);
+    await createMainAgent(id);
+    const session = getLiveSessionById(server!.core.accessor, id);
+    const main = session!.accessor.get(IAgentLifecycleService).handleOf('main')!;
+
+    try {
+      const first = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+        content: [{ type: 'text', text: 'first' }],
+        model: 'stub',
+      });
+      expect(first.body.code).toBe(0);
+      await vi.waitFor(() => expect(heldLlmRequests).toHaveLength(1), { timeout: 8000 });
+
+      const second = await call<PromptItemWire>('POST', `/api/v1/sessions/${id}/prompts`, {
+        content: [{ type: 'text', text: 'second' }],
+        model: 'stub',
+      });
+      expect(second.body.code).toBe(0);
+      expect(second.body.data.status).toBe('queued');
+
+      heldLlmRequests[0]!('first done');
+      const loop = main.accessor.get(IAgentLoopService);
+      await vi.waitFor(() => {
+        expect(loop.snapshot().activePromptId).toBe(second.body.data.prompt_id);
+      }, { timeout: 5000 });
+
+      const steered = await call<{ steered: boolean }>(
+        'POST',
+        `/api/v1/sessions/${id}/prompts:steer`,
+        { prompt_ids: [second.body.data.prompt_id] },
+      );
+      expect(steered.body.code).toBe(0);
+
+      await vi.waitFor(() => expect(heldLlmRequests).toHaveLength(2), { timeout: 5000 });
+      heldLlmRequests[1]!('second done');
+      await vi.waitFor(() => {
+        expect(loop.snapshot().activePromptId).toBeUndefined();
+        expect(loop.snapshot().queue).toEqual([]);
+      }, { timeout: 5000 });
+    } finally {
+      await new Promise<void>((resolve) => llm.close(() => resolve()));
+    }
   });
 
   it('returns 40401 for an unknown session', async () => {

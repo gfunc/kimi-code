@@ -42,18 +42,23 @@ function bundledMessage(skillName: string, user: string, extra: readonly Content
 }
 
 function daemonIntake() {
+  const file = () => ({
+    meta: {
+      id: 'file_1',
+      size: 3,
+      name: 'pic.png',
+      media_type: 'image/png',
+      created_at: '2026-01-01T00:00:00.000Z',
+    },
+    stream: () => Readable.from([new Uint8Array([1, 2, 3])]),
+  });
   return {
-    get: vi.fn(async () => ({
-      meta: {
-        id: 'file_1',
-        size: 3,
-        name: 'pic.png',
-        media_type: 'image/png',
-        created_at: '2026-01-01T00:00:00.000Z',
-      },
-      stream: () => Readable.from([new Uint8Array([1, 2, 3])]),
-    })),
+    get: vi.fn(async () => file()),
     materialize: vi.fn(async (): Promise<string | undefined> => undefined),
+    resolveDisplayPath: vi.fn(async (): Promise<string | undefined> => undefined),
+    open: vi.fn(async () => file()),
+    read: vi.fn(async () => ({ data: new Uint8Array([1, 2, 3]), name: 'pic.png' })),
+    pathFor: vi.fn((): string | undefined => undefined),
   };
 }
 
@@ -215,6 +220,120 @@ describe('prompt queue', () => {
     expect(pendingIds(loop)).toEqual([queued.id]);
 
     hold.release();
+    await loop.settled();
+  });
+
+  it('accepts a steer that races the turn boundary while the next prompt is gated', async () => {
+    setup();
+    const hold = holdNextStep();
+    ctx.mockNextResponse({ type: 'text', text: 'active' });
+    ctx.mockNextResponse({ type: 'text', text: 'next' });
+    const steered: PromptSteered[] = [];
+    ctx.get(IEventBus).subscribe(PromptSteered, (event) => steered.push(event));
+
+    await enqueue(loop, { message: message('active') });
+    await hold.started;
+    const queued = await enqueue(loop, { message: message('next') });
+    let releaseGate!: () => void;
+    let markGated!: () => void;
+    const gated = new Promise<void>((resolve) => {
+      markGated = resolve;
+    });
+    const gateHold = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    loop.hooks.onBeforeSubmitPrompt.register('test-hold-gate', async (_hookCtx, next) => {
+      markGated();
+      await gateHold;
+      await next();
+    });
+
+    hold.release();
+    await gated;
+    await vi.waitFor(() => {
+      expect(loop.snapshot().activePromptId).toBeUndefined();
+      expect(pendingIds(loop)).toEqual([queued.id]);
+    });
+
+    await loop.steer([queued.id]);
+
+    expect(steered).toEqual([]);
+    releaseGate();
+    await expect(queued.completion).resolves.toMatchObject({ state: 'completed' });
+    await loop.settled();
+  });
+
+  it('accepts a steer whose media intake spans the turn boundary', async () => {
+    const intake = daemonIntake();
+    setup(
+      appService(IFileService, {
+        _serviceBrand: undefined,
+        get: intake.get,
+      } as unknown as IFileService),
+      sessionService(ISessionMediaStore, {
+        _serviceBrand: undefined,
+        materialize: intake.materialize,
+        resolveDisplayPath: intake.resolveDisplayPath,
+        open: intake.open,
+        read: intake.read,
+        pathFor: intake.pathFor,
+      } as unknown as ISessionMediaStore),
+    );
+    const hold = holdNextStep();
+    ctx.mockNextResponse({ type: 'text', text: 'active' });
+    ctx.mockNextResponse({ type: 'text', text: 'next' });
+    const steered: PromptSteered[] = [];
+    ctx.get(IEventBus).subscribe(PromptSteered, (event) => steered.push(event));
+
+    await enqueue(loop, { message: message('active') });
+    await hold.started;
+    let releaseIntake!: () => void;
+    intake.get.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseIntake = () => {
+            resolve({
+              meta: {
+                id: 'file_1',
+                size: 3,
+                name: 'pic.png',
+                media_type: 'image/png',
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+              stream: () => Readable.from([new Uint8Array([1, 2, 3])]),
+            });
+          };
+        }),
+    );
+    const queued = await enqueue(loop, {
+      message: {
+        role: 'user',
+        content: [{ type: 'image_url', imageUrl: { url: 'kimi-file://file_1' } }],
+        toolCalls: [],
+        origin: { kind: 'user' },
+      },
+    });
+    let releaseGate!: () => void;
+    const gateHold = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    loop.hooks.onBeforeSubmitPrompt.register('test-hold-gate', async (_hookCtx, next) => {
+      await gateHold;
+      await next();
+    });
+
+    const steerPromise = loop.steer([queued.id]);
+    hold.release();
+    await vi.waitFor(() => {
+      expect(loop.snapshot().activePromptId).toBeUndefined();
+      expect(pendingIds(loop)).toEqual([queued.id]);
+    });
+    releaseIntake();
+
+    await expect(steerPromise).resolves.toBeUndefined();
+    expect(steered).toEqual([]);
+    releaseGate();
+    await expect(queued.completion).resolves.toMatchObject({ state: 'completed' });
     await loop.settled();
   });
 

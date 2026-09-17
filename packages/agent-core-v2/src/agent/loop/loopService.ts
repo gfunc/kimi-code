@@ -361,27 +361,35 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     if (promptIds.length === 0) {
       throw new Error2(ErrorCodes.REQUEST_INVALID, 'prompt_ids must not be empty');
     }
-    const active = this.active;
-    if (active === undefined || !active.prompt.tracked) {
-      throw new Error2(ErrorCodes.PROMPT_NOT_FOUND, 'no active prompt to steer into');
-    }
     const engine = this.machineEngine();
     const ids = new Set(promptIds);
     const queuedIds = new Set(engine.snapshot().queue.map((item) => item.meta?.promptId));
-    if (ids.size !== promptIds.length || ![...ids].every((id) => queuedIds.has(id))) {
+    if (ids.size !== promptIds.length || ![...ids].every((id) => this.steerTargetPending(id, queuedIds))) {
       throw new Error2(ErrorCodes.PROMPT_NOT_FOUND, 'one or more prompts are not pending');
     }
+    const active = this.active;
+    if (active === undefined || !active.prompt.tracked) return;
     for (const id of ids) {
       const entry = engine.snapshot().queue.find((item) => item.meta?.promptId === id);
       if (entry !== undefined) await this.materializeDaemonRefs(entry.message);
     }
     if (
-      this.active !== active ||
-      ![...ids].every((id) => new Set(engine.snapshot().queue.map((item) => item.meta?.promptId)).has(id))
+      ![...ids].every((id) =>
+        this.steerTargetPending(
+          id,
+          new Set(engine.snapshot().queue.map((item) => item.meta?.promptId)),
+        ),
+      )
     ) {
       throw new Error2(ErrorCodes.PROMPT_NOT_FOUND, 'one or more prompts are no longer pending');
     }
-    engine.steer(promptIds);
+    if (this.active === active) engine.steer(promptIds);
+  }
+
+  private steerTargetPending(id: string, queuedIds: Set<string | undefined>): boolean {
+    if (queuedIds.has(id)) return true;
+    if (this.active !== undefined && this.active.prompt.id === id) return true;
+    return this.pendingMachineTurn?.queueItemId === id;
   }
 
   promptHandle(id: string): PromptHandle | undefined {
