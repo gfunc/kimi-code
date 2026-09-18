@@ -374,7 +374,7 @@ export class AgentTranscriptProjector {
           }),
         ];
       case 'context.spliced':
-        return [this.markerOp('undo', restOf(event))];
+        return event.deleteCount > 0 ? [this.markerOp('undo', restOf(event))] : [];
       case 'context.undone':
         return [];
       case 'error':

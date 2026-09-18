@@ -2398,4 +2398,74 @@ describe('foldWireRecordFacts (cold facts)', () => {
     expect(real.state).toBe('failed');
     expect(real.error).toBe('real failure');
   });
+
+  it('renders hook-result context injections as markers so turn ordinals stay aligned with engine turn ids', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'hook context one' }],
+          toolCalls: [],
+          origin: { kind: 'hook_result', event: 'UserPromptSubmit' } as { kind: string },
+        },
+        { id: 'p0', role: 'user', content: [{ type: 'text', text: 'first prompt' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'first answer' }], toolCalls: [] },
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'blocked by hook' }],
+          toolCalls: [],
+          origin: { kind: 'hook_result', event: 'UserPromptSubmit' } as { kind: string },
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'blocked hook output' }],
+          toolCalls: [],
+          origin: { kind: 'hook_result', event: 'UserPromptSubmit', blocked: true } as { kind: string },
+        },
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'second prompt' }],
+          toolCalls: [],
+          origin: { kind: 'user' },
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'second answer' }], toolCalls: [] },
+      ],
+      { turnPromptIds: new Set(['p0']) },
+    );
+
+    const turns = snapshot.items.filter((item) => item.kind === 'turn');
+    expect(turns.map((turn) => (turn.kind === 'turn' ? [turn.turnId, turn.origin.kind, turn.prompt] : []))).toEqual([
+      ['t0', 'user', 'first prompt'],
+      ['t1', 'user', 'second prompt'],
+    ]);
+    const markers = snapshot.items.filter((item) => item.kind === 'marker');
+    expect(markers.map((marker) => (marker.kind === 'marker' ? marker.marker : ''))).toEqual([
+      'hook',
+      'hook',
+      'hook',
+    ]);
+    const payloads = markers.map((marker) =>
+      marker.kind === 'marker' ? (marker.payload as Record<string, unknown>) : {},
+    );
+    expect(payloads[0]).toMatchObject({ hookEvent: 'UserPromptSubmit', content: 'hook context one' });
+    expect(payloads[2]).toMatchObject({ hookEvent: 'UserPromptSubmit', content: 'blocked hook output', blocked: true });
+  });
+
+  it('still opens a turn for a hook-result message that is a recorded engine prompt', () => {
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { id: 'hp0', role: 'user', content: [{ type: 'text', text: 'hook-driven task' }], toolCalls: [], origin: { kind: 'hook_result', event: 'SessionStart' } as { kind: string } },
+        { role: 'assistant', content: [{ type: 'text', text: 'hook answer' }], toolCalls: [] },
+      ],
+      { turnPromptIds: new Set(['hp0']) },
+    );
+
+    expect(snapshot.items.map((item) => item.kind)).toEqual(['turn']);
+    const turn = snapshot.items[0];
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    expect(turn.turnId).toBe('t0');
+    expect(turn.origin.kind).toBe('hook');
+    expect(turn.prompt).toBe('hook-driven task');
+    expect(turn.triggerPromptId).toBe('hp0');
+  });
 });

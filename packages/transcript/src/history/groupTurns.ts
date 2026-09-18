@@ -238,6 +238,15 @@ export function groupMessagesIntoSnapshot(
         }
         continue;
       }
+      if (originKind === 'hook_result') {
+        if (message.id !== undefined && options?.turnPromptIds?.has(message.id) === true) {
+          const opening = foldTurnOpeningInput(message);
+          startTurn(mapOrigin(message), opening.text, opening.attachmentIds, message.id);
+          continue;
+        }
+        pushMarker('hook', hookMarkerPayload(message));
+        continue;
+      }
       const markerKey = originKind !== undefined ? MARKER_USER_ORIGINS[originKind] : undefined;
       if (markerKey !== undefined && !isUserSlashPrompt(message)) {
         pushMarker(markerKey, { text: textOf(message), origin: message.origin });
@@ -315,6 +324,10 @@ export function groupMessagesIntoSnapshot(
     }
 
     if (message.role === 'assistant') {
+      if (message.origin?.kind === 'hook_result') {
+        pushMarker('hook', hookMarkerPayload(message));
+        continue;
+      }
       const current = ensureTurn();
       const stepOrdinal = current.steps.length + 1;
       const step: StepDraft = {
@@ -424,6 +437,19 @@ function opensOwnTurn(message: HistoryMessage): boolean {
     typeof origin.name === 'string' &&
     TURN_OPENING_SYSTEM_TRIGGERS.has(origin.name)
   );
+}
+
+function hookMarkerPayload(message: HistoryMessage): {
+  hookEvent: string | undefined;
+  content: string;
+  blocked: boolean | undefined;
+} {
+  const origin = message.origin as { event?: unknown; blocked?: unknown } | undefined;
+  return {
+    hookEvent: typeof origin?.event === 'string' ? origin.event : undefined,
+    content: textOf(message),
+    blocked: origin?.blocked === true ? true : undefined,
+  };
 }
 
 function isUserSlashPrompt(message: HistoryMessage): boolean {

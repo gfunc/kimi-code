@@ -1687,6 +1687,30 @@ describe('AgentTranscriptProjector', () => {
     expect(markers[7]!.payload).toMatchObject({ start: 1, deleteCount: 2 });
   });
 
+  it('does not project undo markers for pure-append context splices', () => {
+    const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
+    const tx = new AgentTranscript('main');
+
+    tx.apply(
+      projector.map(
+        ev({
+          type: 'context.spliced',
+          start: 25,
+          deleteCount: 0,
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'reminder' }], toolCalls: [] }],
+        }),
+      ),
+    );
+    tx.apply(projector.map(ev({ type: 'context.spliced', start: 0, deleteCount: 3, messages: [] })));
+
+    const markers = tx
+      .getItems()
+      .filter((item): item is Extract<typeof item, { kind: 'marker' }> => item.kind === 'marker');
+    expect(markers).toHaveLength(1);
+    expect(markers[0]!.marker).toBe('undo');
+    expect(markers[0]!.payload).toMatchObject({ start: 0, deleteCount: 3 });
+  });
+
   it('does not infer removed turns from an undo count', () => {
     const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
     expect(projector.map(ev({ type: 'context.undone', agentId: 'main', turns: 1, fromTurnId: 0 }))).toEqual([]);
@@ -4374,6 +4398,88 @@ describe('bindSessionTranscript', () => {
       });
       expect(agent?.getAttachment('t0.att1')).toBeDefined();
       expect(agent?.getAttachment('att_1')).toBeUndefined();
+      service.dropSession('s1');
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a failed live turn after older cold turns with a user origin despite prompt hooks', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'transcript-hook-drift-'));
+    const wirePath = join(home, 'sessions', 'ws', 's1', 'agents', 'main', 'wire.jsonl');
+    const appendWire = async (records: Record<string, unknown>[]): Promise<void> => {
+      await mkdir(join(home, 'sessions', 'ws', 's1', 'agents', 'main'), { recursive: true });
+      await writeFile(wirePath, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    };
+    const hookMessage = (time: number) => ({
+      type: 'context.append_message',
+      time,
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: '<hook_result hook_event="UserPromptSubmit">extra context</hook_result>' }],
+        toolCalls: [],
+        origin: { kind: 'hook_result', event: 'UserPromptSubmit' },
+      },
+    });
+    const promptTurn = (promptId: string, text: string, time: number, turnId?: number) => [
+      { type: 'turn.prompt', time, ...(turnId === undefined ? {} : { turnId }), promptId, origin: { kind: 'user' }, input: [{ type: 'text', text }] },
+      {
+        type: 'context.append_message',
+        time: time + 1,
+        message: { id: promptId, role: 'user', content: [{ type: 'text', text }], toolCalls: [], origin: { kind: 'user' } },
+      },
+    ];
+    const answer = (text: string, time: number) => ({
+      type: 'context.append_message',
+      time,
+      message: { role: 'assistant', content: [{ type: 'text', text }], toolCalls: [] },
+    });
+    const epochOne = [
+      hookMessage(1000),
+      ...promptTurn('p0', 'compare kimi and dsh', 1001),
+      answer('comparison answer', 1100),
+      { type: 'turn.ended', time: 1200, turnId: 0, reason: 'completed' },
+      hookMessage(2000),
+      ...promptTurn('p1', 'check the dir you can access', 2001),
+      answer('dir answer', 2100),
+      { type: 'turn.ended', time: 2200, turnId: 1, reason: 'completed' },
+    ];
+    const epochTwoWire = [
+      ...epochOne,
+      ...promptTurn('p2', 'dsh plugins', 3000, 2),
+      { type: 'turn.ended', time: 3600, turnId: 2, reason: 'failed' },
+    ];
+    await appendWire(epochOne);
+    try {
+      const agents = new FakeAgents();
+      agents.add('main', { loopStatus: { state: 'idle' } });
+      const service = new TranscriptService({ homeDir: home, core: fakeCoreWithAgents(agents) });
+      const store = service.forSessionLive('s1')!;
+      await service.whenReady('s1');
+      const bus = agents.byId('main')!.bus;
+      bus.emit(ev({ type: 'turn.started', turnId: 2, promptId: 'p2', origin: { kind: 'user' }, prompt: 'dsh plugins' }));
+      bus.emit(ev({ type: 'turn.step.started', turnId: 2, step: 1 }));
+      await appendWire(epochTwoWire);
+      const read = vi.spyOn(service, 'readColdSnapshot');
+      bus.emit(ev({ type: 'turn.step.interrupted', turnId: 2, step: 1, reason: 'error', message: '429' }));
+      bus.emit(ev({ type: 'turn.ended', turnId: 2, reason: 'failed' }));
+      await waitFor(() => read.mock.calls.length > 0);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const items = store.getAgent('main')!.getItems();
+      const turns = items.filter((item): item is TranscriptTurn => item.kind === 'turn');
+      expect(turns.map((turn) => turn.prompt)).toEqual([
+        'compare kimi and dsh',
+        'check the dir you can access',
+        'dsh plugins',
+      ]);
+      const failed = turns.at(-1);
+      expect(failed).toMatchObject({
+        turnId: 't2',
+        state: 'failed',
+        origin: { kind: 'user' },
+      });
+      read.mockRestore();
       service.dropSession('s1');
     } finally {
       await rm(home, { recursive: true, force: true });
