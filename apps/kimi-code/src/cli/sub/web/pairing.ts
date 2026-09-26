@@ -2,7 +2,7 @@
  * LAN pairing payload for the Kimi mobile app (spec §4.2).
  *
  * `kimi web --host` prints a `kimi://pair?…` QR next to the Local/Network
- * URLs so a phone can pair by scanning instead of typing host/port/token.
+ * URLs so a phone can pair by scanning instead of typing host/port/code.
  * The QR travels out-of-band, so pairing is trust-on-first-use.
  */
 
@@ -14,8 +14,8 @@ export interface PairingParams {
   host: string;
   /** Actual listening port — after the server auto-incremented past a busy one. */
   port: number;
-  /** Persistent server bearer token (`server.token`). */
-  token: string;
+  /** Short-lived, single-use pairing exchange code. */
+  code: string;
   /** Human-facing machine alias (`os.hostname()`). */
   alias: string;
 }
@@ -24,7 +24,7 @@ export interface PairingParams {
 export const PAIRING_QR_PNG_FILE = 'pairing-qrcode.png';
 
 /**
- * Build the `kimi://pair?host=<ip>&port=<port>&token=<token>&alias=<hostname>`
+ * Build the `kimi://pair?host=<ip>&port=<port>&code=<code>&alias=<hostname>`
  * URI the mobile app consumes. Values are percent-encoded per URI query rules
  * (spaces as `%20`, not `+`).
  */
@@ -32,13 +32,13 @@ export function buildPairingUri(params: PairingParams): string {
   if (params.host === '') {
     throw new Error('pairing URI requires a host');
   }
-  if (params.token === '') {
-    throw new Error('pairing URI requires a token');
+  if (params.code === '') {
+    throw new Error('pairing URI requires a code');
   }
   const query = [
     `host=${encodeURIComponent(params.host)}`,
     `port=${params.port}`,
-    `token=${encodeURIComponent(params.token)}`,
+    `code=${encodeURIComponent(params.code)}`,
     `alias=${encodeURIComponent(params.alias)}`,
   ].join('&');
   return `kimi://pair?${query}`;

@@ -86,6 +86,7 @@ import { createAuthFailureLimiter } from './middleware/rateLimit';
 import { createRemoteControlManager } from '@moonshot-ai/remote-control';
 
 import { createAuthTokenService, type IAuthTokenService } from './services/auth/authTokenService';
+import { registerPairingRoutes } from './routes/pairing';
 import { createCredentialValidator } from './services/auth/credentials';
 import { resolvePasswordHash } from './services/auth/password';
 import { createTokenStore } from './services/auth/tokenStore';
@@ -131,6 +132,7 @@ export interface RunningServer {
   readonly core: Scope;
   readonly connectionRegistry: IConnectionRegistry;
   readonly authTokenService: IAuthTokenService;
+  readonly createPairingCode: () => string;
   readonly host: string;
   readonly port: number;
   close(): Promise<void>;
@@ -455,6 +457,11 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
 
   await registerOpenApi();
 
+  registerPairingRoutes(
+    app as unknown as Parameters<typeof registerPairingRoutes>[0],
+    authTokenService,
+  );
+
   await registerApiV1Routes(app, core, {
     serverVersion,
     hostIdentity: opts.hostIdentity,
@@ -631,7 +638,16 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
   process.on('unhandledRejection', onUnhandledRejection);
   process.on('uncaughtException', onUncaughtException);
 
-  return { app, core, connectionRegistry, authTokenService, host, port: boundPort, close };
+  return {
+    app,
+    core,
+    connectionRegistry,
+    authTokenService,
+    createPairingCode: () => authTokenService.createPairingCode(),
+    host,
+    port: boundPort,
+    close,
+  };
 }
 
 export const PORT_RETRY_LIMIT = 100;

@@ -70,6 +70,7 @@ const WEB_ASSETS_DIR = 'dist-web';
 interface RoutedServer {
   readonly address: string;
   readonly logger: ServerLogger;
+  readonly createPairingCode: () => string;
   close(): Promise<void>;
 }
 
@@ -80,7 +81,9 @@ export interface WebCliOptions extends ServerCliOptions {
 
 export interface StartForegroundHooks {
   /** Fires once the server is listening, before the foreground runner blocks. */
-  onReady?: (origin: string) => void | Promise<void>;
+  onReady?: (origin: string, createPairingCode: () => string) => void | Promise<void>;
+  /** Fires on SIGUSR2 so the caller can reprint the ready banner (a fresh pairing QR). POSIX only — never registered on Windows (no SIGUSR2). */
+  onReprint?: () => void | Promise<void>;
   onShutdown?: (reason: string) => void | Promise<void>;
 }
 
@@ -208,8 +211,18 @@ export async function handleWebCommand(
   }
   const run = deps.startServerForeground ?? startServerForeground;
   let remoteControl: RemoteControlHandle | undefined;
+  // Only the full ready banner carries the pairing QR; a reprint signal for
+  // the compact line (or an auth-bypass run, which never pairs) is pointless.
+  // Reprinting rides on SIGUSR2, which does not exist on Windows (Node throws
+  // ERR_UNKNOWN_SIGNAL when registering one), so it is POSIX-only.
+  const canReprint =
+    process.platform !== 'win32' &&
+    opts.remoteControl !== true &&
+    !parsed.dangerousBypassAuth &&
+    parsed.logLevel === DEFAULT_FOREGROUND_LOG_LEVEL;
+  let printReady: (() => Promise<void>) | undefined;
   await run(parsed, {
-    onReady: async (origin) => {
+    onReady: async (origin, createPairingCode) => {
       // Resolve the persistent token only once the server is up: a fresh
       // server writes `server.token` on first boot, so reading it beforehand
       // would miss first-time starts and the browser would hit the auth gate.
@@ -255,21 +268,36 @@ export async function handleWebCommand(
         if (opts.open === true) deps.openUrl(remoteControl.url);
         return;
       }
-      deps.stdout.write(
-        parsed.logLevel === DEFAULT_FOREGROUND_LOG_LEVEL
-          ? formatReadyBanner(origin, parsed.host, {
-              token,
-              networkAddresses: deps.networkAddresses,
-              dangerousBypassAuth: parsed.dangerousBypassAuth,
-              pairingQr: await generatePairingQr(origin, parsed.host, token, deps),
-            })
-          : formatReadyLine(origin, token, parsed.dangerousBypassAuth),
-      );
+      const print = async (): Promise<void> => {
+        deps.stdout.write(
+          parsed.logLevel === DEFAULT_FOREGROUND_LOG_LEVEL
+            ? formatReadyBanner(origin, parsed.host, {
+                token,
+                networkAddresses: deps.networkAddresses,
+                dangerousBypassAuth: parsed.dangerousBypassAuth,
+                pairingQr: await generatePairingQr(
+                  origin,
+                  parsed.host,
+                  parsed.dangerousBypassAuth ? undefined : createPairingCode(),
+                  deps,
+                ),
+                reprintHint: canReprint ? `kill -USR2 ${process.pid}` : undefined,
+              })
+            : formatReadyLine(origin, token, parsed.dangerousBypassAuth),
+        );
+      };
+      printReady = print;
+      await print();
       if (opts.open === true) {
         const openOrigin = browserOpenOrigin(origin);
         deps.openUrl(token !== undefined ? buildWebUrl(openOrigin, token) : openOrigin);
       }
     },
+    onReprint: canReprint
+      ? () => {
+          void printReady?.();
+        }
+      : undefined,
     onShutdown: async () => {
       await remoteControl?.close();
     },
@@ -397,6 +425,7 @@ async function runServerInProcess(
   running = {
     address: `http://${v2.host}:${v2.port}`,
     logger,
+    createPairingCode: v2.createPairingCode,
     close: () => v2.close(),
   };
 
@@ -408,11 +437,27 @@ async function runServerInProcess(
   process.once('SIGTERM', () => {
     void shutdown('SIGTERM');
   });
+  if (hooks.onReprint !== undefined && process.platform !== 'win32') {
+    // SIGUSR2 is POSIX-only: `process.on('SIGUSR2')` throws ERR_UNKNOWN_SIGNAL
+    // on Windows, so the reprint hook is never registered there even when a
+    // caller supplies one.
+    const onReprint = hooks.onReprint;
+    process.on('SIGUSR2', () => {
+      void Promise.resolve()
+        .then(onReprint)
+        .catch((error) => {
+          running?.logger.error(
+            { err: error instanceof Error ? error : new Error(String(error)) },
+            'reprint hook error',
+          );
+        });
+    });
+  }
 
   running.logger.info({ address: running.address }, 'server ready');
 
   try {
-    await hooks.onReady?.(running.address);
+    await hooks.onReady?.(running.address, running.createPairingCode);
   } catch (error) {
     try {
       await hooks.onShutdown?.('startup_failed');
@@ -462,6 +507,8 @@ interface FormatReadyBannerOptions {
   dangerousBypassAuth?: boolean;
   /** LAN pairing QR for the mobile app (spec §4.2); omitted when not pairable. */
   pairingQr?: TerminalQr;
+  /** Shell command that reprints the banner with a fresh pairing code; shown in the pairing block. */
+  reprintHint?: string;
 }
 
 /** A terminal-rendered QR plus its PNG fallback path, as built by `generateQr`. */
@@ -473,28 +520,27 @@ interface TerminalQr {
 /**
  * Render the LAN pairing QR for the ready banner.
  *
- * The QR encodes `kimi://pair?host&port&token&alias` — the out-of-band
+ * The QR encodes `kimi://pair?host&port&code&alias` — the out-of-band
  * payload the mobile app scans (spec §4.2) — with the same plumbing as the
  * Remote Control QR (inline image / half-blocks / PNG fallback). Best-effort
- * and additive: loopback binds, an unresolvable token (`--dangerous-bypass-auth`
- * or a missing token file), a wildcard bind without a usable LAN address, or a
- * QR/PNG write failure all degrade to `undefined` — the Local/Network URLs
- * above stay the primary way in.
+ * and additive: loopback binds, auth bypass, a wildcard bind without a usable
+ * LAN address, or a QR/PNG write failure all degrade to `undefined` — the
+ * Local/Network URLs above stay the primary way in.
  */
 async function generatePairingQr(
   origin: string,
   bindHost: string,
-  token: string | undefined,
+  code: string | undefined,
   deps: Pick<WebCommandDeps, 'networkAddresses' | 'hostname'>,
 ): Promise<TerminalQr | undefined> {
-  if (token === undefined) return undefined;
+  if (code === undefined) return undefined;
   const host = pairingLanHost(bindHost, deps.networkAddresses ?? listNetworkAddresses());
   if (host === undefined) return undefined;
   const port = Number(origin.slice(origin.lastIndexOf(':') + 1));
   const uri = buildPairingUri({
     host,
     port,
-    token,
+    code,
     alias: deps.hostname?.() ?? osHostname(),
   });
   try {
@@ -575,6 +621,11 @@ export function formatReadyBanner(
     lines.push(
       `  ${label('QR PNG:   ')}${opts.pairingQr.pngPath} ${muted('(open this if the QR above does not scan)')}`,
     );
+    if (opts.reprintHint !== undefined) {
+      lines.push(
+        `  ${label('Reprint:  ')}${opts.reprintHint} ${muted('(prints a fresh pairing code — the old one is single-use)')}`,
+      );
+    }
     lines.push('');
   }
 

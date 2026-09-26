@@ -32,6 +32,25 @@ describe('server-v2 /api/v1 bearer auth', () => {
     expect(res.statusCode).toBe(200);
   });
 
+  it('allows the pairing exchange POST without a token', async () => {
+    const res = await server!.app.inject({
+      method: 'POST',
+      url: '/api/v1/pairing/exchange',
+      payload: { code: 'no-such-code' },
+    });
+    expect(res.statusCode).toBe(401);
+    const body = res.json() as Record<string, unknown>;
+    expect(body['code']).toBe(40101);
+    expect(body['msg']).toBe('Invalid or expired pairing code');
+  });
+
+  it('keeps the token requirement for other methods on the pairing path', async () => {
+    const res = await server!.app.inject({ method: 'GET', url: '/api/v1/pairing/exchange' });
+    expect(res.statusCode).toBe(401);
+    const body = res.json() as Record<string, unknown>;
+    expect(body['code']).toBe(40101);
+  });
+
   it('rejects /api/v1/auth without a token with 40101', async () => {
     const res = await server!.app.inject({ method: 'GET', url: '/api/v1/auth' });
     expect(res.statusCode).toBe(401);

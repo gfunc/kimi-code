@@ -102,6 +102,45 @@ describe('production auth wiring', () => {
     await boot();
   });
 
+  it('exchanges a pairing code for a device token and consumes it once', async () => {
+    const unknown = await fetch(`${base}/api/v1/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: 'never-issued' }),
+    });
+    expect(unknown.status).toBe(401);
+    const unknownBody = (await unknown.json()) as { code: number; msg: string };
+    expect(unknownBody.code).toBe(40101);
+    expect(unknownBody.msg).toBe('Invalid or expired pairing code');
+
+    const code = (server as RunningServer).authTokenService.createPairingCode();
+    const response = await fetch(`${base}/api/v1/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      code: number;
+      data: { token: string; scope: string };
+    };
+    expect(body.code).toBe(0);
+    expect(body.data.scope).toBe('device');
+    expect(body.data.token).not.toContain((await readFile(join(home as string, 'server.token'), 'utf8')).trim());
+
+    const replay = await fetch(`${base}/api/v1/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    expect(replay.status).toBe(401);
+
+    const gated = await fetch(`${base}/api/v1/auth`, {
+      headers: { Authorization: `Bearer ${body.data.token}` },
+    });
+    expect(gated.status).toBe(200);
+  });
+
   it('gates HTTP: 200 with the token, 401 without', async () => {
     const token = (await readFile(join(home as string, 'server.token'), 'utf8')).trim();
 

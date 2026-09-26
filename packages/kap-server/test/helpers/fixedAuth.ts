@@ -5,5 +5,7 @@ export function fixedTokenAuth(token = 'test-token'): IAuthTokenService {
     _serviceBrand: undefined,
     getToken: () => token,
     isValid: async (candidate) => candidate === token,
+    createPairingCode: () => 'test-pairing-code',
+    exchangePairingCode: () => undefined,
   };
 }

@@ -7,6 +7,7 @@ import { pino, type Logger } from 'pino';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { type RunningServer, startServer } from '../src/start';
+import { fixedTokenAuth } from './helpers/fixedAuth';
 import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
 
 const createdDirs: string[] = [];
@@ -140,11 +141,7 @@ describe('auth-failure rate limit on a real bind', () => {
       homeDir: home,
       logLevel: 'silent',
       insecureNoTls: true,
-      authTokenService: {
-        _serviceBrand: undefined,
-        getToken: () => 'persistent-token',
-        isValid: async (candidate) => candidate === 'persistent-token',
-      },
+      authTokenService: fixedTokenAuth('persistent-token'),
     });
     running.push(server);
     const url = `http://127.0.0.1:${server.port}/api/v1/sessions`;

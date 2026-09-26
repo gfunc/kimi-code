@@ -190,6 +190,28 @@ describe('createAuthTokenService', () => {
     await store.dispose();
   });
 
+  it('exchanges pairing codes once for scoped device tokens', async () => {
+    const store = await createTokenStore(join(tmpDir, 'home'));
+    const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined, now: () => 1000 });
+    const code = svc.createPairingCode();
+    const exchange = svc.exchangePairingCode(code);
+    expect(exchange?.scope).toBe('device');
+    expect(exchange?.token).not.toBe(store.getToken());
+    expect(await svc.isValid(exchange!.token)).toBe(true);
+    expect(svc.exchangePairingCode(code)).toBeUndefined();
+    await store.dispose();
+  });
+
+  it('expires pairing codes', async () => {
+    const store = await createTokenStore(join(tmpDir, 'home'));
+    let time = 1000;
+    const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined, now: () => time });
+    const code = svc.createPairingCode();
+    time += 60_000;
+    expect(svc.exchangePairingCode(code)).toBeUndefined();
+    await store.dispose();
+  });
+
   it('isValid accepts the token', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
     const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined });

@@ -4,10 +4,19 @@
  * These tests don't actually start the server — the foreground runner is
  * injected, so they verify option parsing, the ready banner / one-line ready
  * output, browser opening, and the rotate-token / deprecated `kimi server kill`
- * subcommands against fake deps.
+ * subcommands against fake deps. The SIGUSR2 reprint-hook tests are the one
+ * exception: they run the real in-process runner against a mocked kap-server
+ * so the process-level signal registration itself is under test.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,7 +30,7 @@ import { resetCapabilitiesCache, setCapabilities } from '@moonshot-ai/pi-tui';
 
 import { registerWebCommand } from '#/cli/sub/web';
 import type { LegacyKillDeps } from '#/cli/sub/web/legacy-kill';
-import type { WebCommandDeps } from '#/cli/sub/web/run';
+import type { StartForegroundHooks, WebCommandDeps } from '#/cli/sub/web/run';
 import type { ParsedServerOptions } from '#/cli/sub/web/shared';
 import { darkColors } from '#/tui/theme/colors';
 
@@ -54,7 +63,7 @@ function makeRunner(origin = 'http://127.0.0.1:58627'): {
   const calls: { options: ParsedServerOptions | undefined } = { options: undefined };
   const runner: ForegroundRunner = async (options, hooks) => {
     calls.options = options;
-    await hooks?.onReady?.(origin);
+    await hooks?.onReady?.(origin, () => 'code-pair');
     return undefined as never;
   };
   return { runner, calls };
@@ -345,28 +354,28 @@ describe('ready banner reflects the bind class', () => {
 });
 
 describe('buildPairingUri', () => {
-  it('encodes the bound host, actual port, persistent token, and hostname alias', async () => {
+  it('encodes the bound host, actual port, exchange code, and hostname alias', async () => {
     const { buildPairingUri } = await import('#/cli/sub/web/pairing');
     expect(
-      buildPairingUri({ host: '192.168.1.5', port: 58627, token: 'tok-abc', alias: 'devbox' }),
-    ).toBe('kimi://pair?host=192.168.1.5&port=58627&token=tok-abc&alias=devbox');
+      buildPairingUri({ host: '192.168.1.5', port: 58627, code: 'code-abc', alias: 'devbox' }),
+    ).toBe('kimi://pair?host=192.168.1.5&port=58627&code=code-abc&alias=devbox');
   });
 
   it('percent-encodes special characters in the query values', async () => {
     const { buildPairingUri } = await import('#/cli/sub/web/pairing');
     expect(
-      buildPairingUri({ host: '192.168.1.5', port: 58627, token: 'a b&c', alias: 'my box' }),
-    ).toBe('kimi://pair?host=192.168.1.5&port=58627&token=a%20b%26c&alias=my%20box');
+      buildPairingUri({ host: '192.168.1.5', port: 58627, code: 'a b&c', alias: 'my box' }),
+    ).toBe('kimi://pair?host=192.168.1.5&port=58627&code=a%20b%26c&alias=my%20box');
   });
 
-  it('rejects a missing host or token', async () => {
+  it('rejects a missing host or code', async () => {
     const { buildPairingUri } = await import('#/cli/sub/web/pairing');
     expect(() =>
-      buildPairingUri({ host: '', port: 58627, token: 'tok', alias: 'devbox' }),
+      buildPairingUri({ host: '', port: 58627, code: 'code', alias: 'devbox' }),
     ).toThrow(/host/);
     expect(() =>
-      buildPairingUri({ host: '192.168.1.5', port: 58627, token: '', alias: 'devbox' }),
-    ).toThrow(/token/);
+      buildPairingUri({ host: '192.168.1.5', port: 58627, code: '', alias: 'devbox' }),
+    ).toThrow(/code/);
   });
 });
 
@@ -417,7 +426,7 @@ describe('LAN pairing QR in the ready banner', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it('prints a scannable kimi://pair QR with the LAN IP, the actual port, the token, and the alias', async () => {
+  it('prints a scannable kimi://pair QR with the LAN IP, the actual port, the exchange code, and the alias', async () => {
     const { handleWebCommand } = await import('#/cli/sub/web/run');
     const { renderTerminalQr } = await import('#/utils/remote-control-qr');
     // The runner reports the actual bound origin: the port auto-incremented
@@ -441,14 +450,17 @@ describe('LAN pairing QR in the ready banner', () => {
       },
     );
 
-    const uri = 'kimi://pair?host=192.168.1.5&port=58628&token=tok-pair&alias=devbox';
+    const uri = 'kimi://pair?host=192.168.1.5&port=58628&code=code-pair&alias=devbox';
     const raw = readStdout();
     // The terminal QR is exactly the half-block rendering of that payload
     // (compare with the two-space banner indent removed).
     const dedented = raw.split('\n').map((line) => line.replace(/^ {2}/, '')).join('\n');
     expect(dedented).toContain(renderTerminalQr(uri));
     // The PNG fallback encodes the same payload byte-for-byte.
-    expect(readFileSync(join(home, 'pairing-qrcode.png'))).toEqual(await QRCode.toBuffer(uri));
+    const pngPath = join(home, 'pairing-qrcode.png');
+    expect(readFileSync(pngPath)).toEqual(await QRCode.toBuffer(uri));
+    expect(statSync(home).mode & 0o777).toBe(0o700);
+    expect(statSync(pngPath).mode & 0o777).toBe(0o600);
 
     const plain = stripAnsi(raw);
     expect(plain).toContain('Pairing:');
@@ -486,16 +498,14 @@ describe('LAN pairing QR in the ready banner', () => {
     expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
   });
 
-  it('prints no pairing QR when no token is available or auth is bypassed', async () => {
+  it('keeps pairing available when the persistent token is not resolvable', async () => {
     const { handleWebCommand } = await import('#/cli/sub/web/run');
-    for (const opts of [
-      { host: '0.0.0.0' as const, open: false },
-      { host: '0.0.0.0' as const, open: false, dangerousBypassAuth: true },
-    ]) {
-      const { runner } = makeRunner('http://0.0.0.0:58627');
-      const { stdout, stderr, readStdout } = makeIo();
+    const { runner } = makeRunner('http://0.0.0.0:58627');
+    const { stdout, stderr, readStdout } = makeIo();
 
-      await handleWebCommand(opts, {
+    await handleWebCommand(
+      { host: '0.0.0.0', open: false },
+      {
         startServerForeground: runner,
         resolveToken: () => undefined,
         networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
@@ -503,13 +513,40 @@ describe('LAN pairing QR in the ready banner', () => {
         openUrl: vi.fn(),
         stdout,
         stderr,
-      });
+      },
+    );
 
-      const plain = stripAnsi(readStdout());
-      expect(plain).toContain('Kimi server ready');
-      expect(plain).not.toContain('Pairing:');
-      expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
-    }
+    const plain = stripAnsi(readStdout());
+    expect(plain).toContain('Pairing:');
+    // The code never prints as text; it rides in the QR payload.
+    expect(readFileSync(join(home, 'pairing-qrcode.png'))).toEqual(
+      await QRCode.toBuffer('kimi://pair?host=192.168.1.5&port=58627&code=code-pair&alias=devbox'),
+    );
+    expect(plain).toContain('Reprint:');
+  });
+
+  it('prints no pairing QR when auth is bypassed', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { runner } = makeRunner('http://0.0.0.0:58627');
+    const { stdout, stderr, readStdout } = makeIo();
+
+    await handleWebCommand(
+      { host: '0.0.0.0', open: false, dangerousBypassAuth: true },
+      {
+        startServerForeground: runner,
+        resolveToken: () => undefined,
+        networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+        hostname: () => 'devbox',
+        openUrl: vi.fn(),
+        stdout,
+        stderr,
+      },
+    );
+
+    const plain = stripAnsi(readStdout());
+    expect(plain).toContain('Kimi server ready');
+    expect(plain).not.toContain('Pairing:');
+    expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
   });
 
   it('prints no pairing QR on a wildcard bind without any LAN address', async () => {
@@ -534,6 +571,194 @@ describe('LAN pairing QR in the ready banner', () => {
     expect(plain).toContain('Kimi server ready');
     expect(plain).not.toContain('Pairing:');
     expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
+  });
+});
+
+describe('SIGUSR2 reprint hook is POSIX-only', () => {
+  const REAL_SERVER_OPTIONS: ParsedServerOptions = {
+    host: '127.0.0.1',
+    port: 58627,
+    logLevel: 'silent',
+    debugEndpoints: false,
+    insecureNoTls: true,
+    allowRemoteShutdown: false,
+    dangerousBypassAuth: false,
+    allowedHosts: [],
+  };
+  const LIFECYCLE_SIGNALS = new Set(['SIGINT', 'SIGTERM', 'SIGUSR2']);
+
+  /**
+   * Fake kap-server (no port bind, no engine) and telemetry (no sink) for the
+   * real in-process runner, scoped to these tests via `vi.doMock`. Scoped —
+   * not file-level — because the rotate-token tests depend on `resetModules`
+   * re-evaluating the real kap-server with their stubbed `KIMI_CODE_HOME`
+   * (`getLiveServerInstance()` reads its instances dir at module load).
+   */
+  function mockServerSeams(): void {
+    vi.doMock('@moonshot-ai/kap-server', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('@moonshot-ai/kap-server')>();
+      const fakeLogger = { info: vi.fn(), error: vi.fn() };
+      return {
+        ...actual,
+        createServerLogger: () => fakeLogger,
+        startServer: vi.fn(async () => ({
+          host: '127.0.0.1',
+          port: 58627,
+          createPairingCode: () => 'code-pair',
+          close: async () => {},
+        })),
+      };
+    });
+    vi.doMock('@moonshot-ai/kimi-telemetry', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('@moonshot-ai/kimi-telemetry')>();
+      return {
+        ...actual,
+        initializeTelemetry: vi.fn(),
+        track: vi.fn(),
+        shutdownTelemetry: vi.fn(async () => {}),
+      };
+    });
+    // run.ts is already cached from the file's static imports; drop the cache
+    // so the next dynamic import binds the mocked seams.
+    vi.resetModules();
+  }
+
+  function unmockServerSeams(): void {
+    vi.doUnmock('@moonshot-ai/kap-server');
+    vi.doUnmock('@moonshot-ai/kimi-telemetry');
+    vi.resetModules();
+  }
+
+  function spySignals() {
+    const onSpy = vi.spyOn(process, 'on');
+    const onceSpy = vi.spyOn(process, 'once');
+    return {
+      onSpy,
+      onceSpy,
+      // Remove exactly what these tests registered; leave vitest infra alone.
+      cleanup: () => {
+        for (const [signal, listener] of [...onSpy.mock.calls, ...onceSpy.mock.calls]) {
+          if (LIFECYCLE_SIGNALS.has(String(signal))) {
+            process.off(signal as NodeJS.Signals, listener as never);
+          }
+        }
+        onSpy.mockRestore();
+        onceSpy.mockRestore();
+      },
+    };
+  }
+
+  /**
+   * Drive the real in-process foreground runner (against the mocked
+   * kap-server) until `onReady` fires. The runner never settles after that,
+   * so each test must call `cleanup()` to unregister the lifecycle listeners.
+   */
+  async function runForegroundUntilReady(hooks: StartForegroundHooks = {}): Promise<void> {
+    mockServerSeams();
+    const { startServerForeground } = await import('#/cli/sub/web/run');
+    let resolveReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const blocking = startServerForeground(REAL_SERVER_OPTIONS, {
+      ...hooks,
+      onReady: async (origin, createPairingCode) => {
+        await hooks.onReady?.(origin, createPairingCode);
+        resolveReady();
+      },
+    });
+    void blocking.catch(() => {});
+    await ready;
+  }
+
+  function stubTmpHome(prefix: string): string {
+    const home = mkdtempSync(join(tmpdir(), prefix));
+    vi.stubEnv('KIMI_CODE_HOME', home);
+    return home;
+  }
+
+  it('drops reprint eligibility on win32: the runner gets no onReprint and the banner has no Reprint hint', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const home = stubTmpHome('kimi-web-win-elig-');
+    setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    try {
+      const seen: { hooks?: StartForegroundHooks } = {};
+      const runner: ForegroundRunner = async (_options, hooks) => {
+        seen.hooks = hooks;
+        await hooks?.onReady?.('http://0.0.0.0:58627', () => 'code-pair');
+        return undefined as never;
+      };
+      const { stdout, stderr, readStdout } = makeIo();
+
+      await handleWebCommand(
+        { host: '0.0.0.0', open: false },
+        {
+          startServerForeground: runner,
+          resolveToken: () => 'tok-win',
+          networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+          hostname: () => 'devbox',
+          openUrl: vi.fn(),
+          stdout,
+          stderr,
+        },
+      );
+
+      expect(seen.hooks?.onReprint).toBeUndefined();
+      expect(seen.hooks?.onReady).toBeDefined();
+      const plain = stripAnsi(readStdout());
+      // The pairing QR itself still prints; only the SIGUSR2 reprint hint goes.
+      expect(plain).toContain('Pairing:');
+      expect(plain).not.toContain('Reprint:');
+    } finally {
+      platformSpy.mockRestore();
+      vi.unstubAllEnvs();
+      resetCapabilitiesCache();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('registers no SIGUSR2 listener on win32 (even when a hook is supplied) while startup continues', async () => {
+    const home = stubTmpHome('kimi-web-win-runner-');
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const { onSpy, onceSpy, cleanup } = spySignals();
+    try {
+      await runForegroundUntilReady({ onReprint: () => {} });
+
+      // Startup continued far enough to fire onReady, with the normal
+      // lifecycle handlers in place and no SIGUSR2 anywhere.
+      expect(onceSpy.mock.calls.map(([signal]) => signal)).toEqual(
+        expect.arrayContaining(['SIGINT', 'SIGTERM']),
+      );
+      expect(onSpy.mock.calls.map(([signal]) => signal)).not.toContain('SIGUSR2');
+    } finally {
+      unmockServerSeams();
+      cleanup();
+      platformSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('registers the SIGUSR2 reprint listener on POSIX and fires the hook (control)', async () => {
+    if (process.platform === 'win32') return;
+    const home = stubTmpHome('kimi-web-posix-runner-');
+    const { onSpy, cleanup } = spySignals();
+    try {
+      const reprint = vi.fn();
+      await runForegroundUntilReady({ onReprint: reprint });
+
+      const registration = onSpy.mock.calls.find(([signal]) => signal === 'SIGUSR2');
+      expect(registration).toBeDefined();
+      (registration![1] as () => void)();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(reprint).toHaveBeenCalledTimes(1);
+    } finally {
+      unmockServerSeams();
+      cleanup();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

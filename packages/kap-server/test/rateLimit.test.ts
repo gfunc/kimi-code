@@ -6,23 +6,15 @@ import {
   createAuthFailureLimiter,
   type AuthFailureLimiter,
 } from '../src/middleware/rateLimit';
-import type { IAuthTokenService } from '../src/services/auth/authTokenService';
+import { fixedTokenAuth } from './helpers/fixedAuth';
 
 const TOKEN = 'test-token';
 const IP_A = '203.0.113.10';
 const IP_B = '203.0.113.11';
 
-function fixedImpl(): IAuthTokenService {
-  return {
-    _serviceBrand: undefined,
-    getToken: () => TOKEN,
-    isValid: async (candidate) => candidate === TOKEN,
-  };
-}
-
 function buildApp(limiter?: AuthFailureLimiter): FastifyInstance {
   const app = Fastify({ trustProxy: true });
-  app.addHook('onRequest', createAuthHook(fixedImpl(), { limiter }));
+  app.addHook('onRequest', createAuthHook(fixedTokenAuth(TOKEN), { limiter }));
   app.get('/api/v1/sessions', async () => ({ ok: true }));
   return app;
 }
