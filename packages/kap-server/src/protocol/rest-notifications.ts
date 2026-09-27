@@ -5,6 +5,7 @@ export const notificationsConfigResponseSchema = z.object({
   flag_enabled: z.boolean(),
   ntfy_url: z.string(),
   topic: z.string().nullable(),
+  subscription_token: z.string().nullable().optional(),
   min_priority: z.number().int().min(1).max(5),
   events: z.array(z.string()),
 });

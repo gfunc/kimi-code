@@ -229,6 +229,7 @@ export class NotificationsService {
         title: 'Resolved',
         message: `interaction resolved - session ${known.sessionId ?? 'unknown'} - ${id}`,
         tags: ['white_check_mark'],
+        click: resolvedClickOf(known, id),
       },
       true,
     );
@@ -336,4 +337,11 @@ function sessionTagOf(interaction: Interaction): string | undefined {
 
 function kindEventOf(kind: InteractionKind): NotificationEvent {
   return kind === 'question' ? 'question.requested' : 'approval.requested';
+}
+
+function resolvedClickOf(known: KnownInteraction, id: string): string | undefined {
+  const sessionId = known.sessionId;
+  if (sessionId === undefined) return undefined;
+  const kindPath = known.kind === 'question' ? 'question' : 'approval';
+  return `kimi://session/${sessionId}/${kindPath}/${id}`;
 }

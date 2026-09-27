@@ -180,6 +180,8 @@ Multiple instances can share one home directory: each registers itself under `~/
 
 `kimi web` binds to local loopback only by default and prints the bearer token in the startup banner; the web UI authenticates automatically via the `#token=` URL fragment.
 
+With `--host`, the banner also prints a `kimi://pair?…` QR for the Kimi mobile app. The embedded pairing code expires 60 seconds after it is printed and is single-use; the banner's `Reprint:` hint (`kill -USR2 <pid>`) prints a fresh one without restarting. See [Using Kimi Code in the browser](../guides/web.md#pair-the-kimi-mobile-app-over-lan).
+
 ::: info
 The `kimi server` command tree is deprecated: any `kimi server …` invocation (including all legacy subcommands) only prints a deprecation notice and exits with code 1 — use `kimi web` instead. The one exception is `kimi server kill`, which stays functional for stopping servers started by a version before 0.28.0. The notice will be removed in the next major version of Kimi Code.
 :::
@@ -194,7 +196,7 @@ Deprecated — only stops a server started by a version before 0.28.0. Those ver
 
 #### `kimi web rotate-token`
 
-Generate a new persistent bearer token (written to `~/.kimi-code/server.token`); the previous token stops working immediately. The token is shared by the whole home directory, so every running instance picks the new one up on its next auth check — no restart needed.
+Generate a new persistent bearer token (written to `~/.kimi-code/server.token`); the previous token stops working immediately. The token is shared by the whole home directory, so every running instance picks the new one up on its next auth check — no restart needed. Devices paired over LAN keep working: their device tokens are stored separately and are unaffected by rotation.
 
 ### `kimi install-desktop`
 

@@ -22,6 +22,10 @@ import {
   rotateServerToken,
 } from '../src/services/auth/persistentToken';
 import { createTokenStore } from '../src/services/auth/tokenStore';
+import {
+  createDeviceTokenStore,
+  hashDeviceToken,
+} from '../src/services/auth/deviceTokenStore';
 import { createAuthTokenService } from '../src/services/auth/authTokenService';
 import { resolvePasswordHash, verifyPassword } from '../src/services/auth/password';
 
@@ -182,68 +186,248 @@ describe('password', () => {
   });
 });
 
+describe('deviceTokenStore', () => {
+  it('stores device tokens only as sha256 hashes at server/auth/device-tokens.json', async () => {
+    const home = join(tmpDir, 'home');
+    const devices = await createDeviceTokenStore(home);
+    expect(devices.path).toBe(join(home, 'server', 'auth', 'device-tokens.json'));
+    const token = 'device-token-plaintext-value';
+    await devices.add(token);
+    expect(devices.has(token)).toBe(true);
+    expect(devices.has('other-token')).toBe(false);
+    const raw = readFileSync(devices.path, 'utf8');
+    expect(raw).not.toContain(token);
+    expect(raw).toContain(hashDeviceToken(token));
+    await devices.dispose();
+  });
+
+  it.skipIf(process.platform === 'win32')('writes device-tokens.json with mode 0600 inside a 0700 dir', async () => {
+    const home = join(tmpDir, 'home');
+    const devices = await createDeviceTokenStore(home);
+    await devices.add('token-value');
+    expect(statSync(devices.path).mode & 0o777).toBe(0o600);
+    expect(statSync(join(home, 'server', 'auth')).mode & 0o777).toBe(0o700);
+    await devices.dispose();
+  });
+
+  it('keeps surviving tokens valid after the store is recreated', async () => {
+    const home = join(tmpDir, 'home');
+    const devices = await createDeviceTokenStore(home);
+    await devices.add('keeper');
+    await devices.dispose();
+    const recreated = await createDeviceTokenStore(home);
+    expect(recreated.has('keeper')).toBe(true);
+    expect(recreated.has('never-added')).toBe(false);
+    await recreated.dispose();
+  });
+
+  it('drops revoked hashes from memory and disk', async () => {
+    const home = join(tmpDir, 'home');
+    const devices = await createDeviceTokenStore(home);
+    await devices.add('keeper');
+    await devices.add('gone');
+    expect(await devices.revoke('gone')).toBe(true);
+    expect(await devices.revoke('gone')).toBe(false);
+    expect(devices.has('gone')).toBe(false);
+    expect(devices.has('keeper')).toBe(true);
+    await devices.dispose();
+    const recreated = await createDeviceTokenStore(home);
+    expect(recreated.has('gone')).toBe(false);
+    expect(recreated.has('keeper')).toBe(true);
+    await recreated.dispose();
+  });
+
+  it('starts empty when the stored file is corrupt', async () => {
+    const home = join(tmpDir, 'home');
+    const devices = await createDeviceTokenStore(home);
+    await devices.add('survivor');
+    await devices.dispose();
+    writeFileSync(devices.path, '{not json');
+    const recreated = await createDeviceTokenStore(home);
+    expect(recreated.has('survivor')).toBe(false);
+    await recreated.dispose();
+  });
+
+  it.skipIf(process.platform === 'win32')('starts empty when the stored file is too permissive', async () => {
+    const home = join(tmpDir, 'home');
+    const devices = await createDeviceTokenStore(home);
+    await devices.add('survivor');
+    await devices.dispose();
+    chmodSync(devices.path, 0o644);
+    const recreated = await createDeviceTokenStore(home);
+    expect(recreated.has('survivor')).toBe(false);
+    await recreated.dispose();
+  });
+
+  it('starts empty when the stored file is absent', async () => {
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
+    expect(devices.has('anything')).toBe(false);
+    await devices.dispose();
+  });
+});
+
 describe('createAuthTokenService', () => {
   it('getToken() returns the tokenStore token', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
-    const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined });
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash: undefined,
+    });
     expect(svc.getToken()).toBe(store.getToken());
     await store.dispose();
+    await devices.dispose();
   });
 
   it('exchanges pairing codes once for scoped device tokens', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
-    const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined, now: () => 1000 });
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash: undefined,
+      now: () => 1000,
+    });
     const code = svc.createPairingCode();
-    const exchange = svc.exchangePairingCode(code);
+    const exchange = await svc.exchangePairingCode(code);
     expect(exchange?.scope).toBe('device');
     expect(exchange?.token).not.toBe(store.getToken());
     expect(await svc.isValid(exchange!.token)).toBe(true);
-    expect(svc.exchangePairingCode(code)).toBeUndefined();
+    expect(await svc.exchangePairingCode(code)).toBeUndefined();
     await store.dispose();
+    await devices.dispose();
   });
 
   it('expires pairing codes', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
     let time = 1000;
-    const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined, now: () => time });
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash: undefined,
+      now: () => time,
+    });
     const code = svc.createPairingCode();
     time += 60_000;
-    expect(svc.exchangePairingCode(code)).toBeUndefined();
+    expect(await svc.exchangePairingCode(code)).toBeUndefined();
     await store.dispose();
+    await devices.dispose();
+  });
+
+  it('keeps exchanged device tokens valid after the service is recreated', async () => {
+    const home = join(tmpDir, 'home');
+    const storeA = await createTokenStore(home);
+    const devicesA = await createDeviceTokenStore(home);
+    const svcA = createAuthTokenService({
+      tokenStore: storeA,
+      deviceTokenStore: devicesA,
+      passwordHash: undefined,
+    });
+    const code = svcA.createPairingCode();
+    const exchange = await svcA.exchangePairingCode(code);
+    const token = exchange!.token;
+    await storeA.dispose();
+    await devicesA.dispose();
+
+    const storeB = await createTokenStore(home);
+    const devicesB = await createDeviceTokenStore(home);
+    const svcB = createAuthTokenService({
+      tokenStore: storeB,
+      deviceTokenStore: devicesB,
+      passwordHash: undefined,
+    });
+    expect(await svcB.isValid(token)).toBe(true);
+    expect(await svcB.isValid(svcB.getToken())).toBe(true);
+    expect(await svcB.exchangePairingCode(code)).toBeUndefined();
+    await storeB.dispose();
+    await devicesB.dispose();
+  });
+
+  it('revokes a device token only when its own plaintext is presented', async () => {
+    const home = join(tmpDir, 'home');
+    const store = await createTokenStore(home);
+    const devices = await createDeviceTokenStore(home);
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash: undefined,
+    });
+    const exchange = await svc.exchangePairingCode(svc.createPairingCode());
+    const token = exchange!.token;
+    expect(await svc.isValid(token)).toBe(true);
+
+    expect(await svc.revokeDeviceToken('not-the-token')).toBe(false);
+    expect(await svc.isValid(token)).toBe(true);
+
+    expect(await svc.revokeDeviceToken(token)).toBe(true);
+    expect(await svc.isValid(token)).toBe(false);
+    expect(await svc.revokeDeviceToken(token)).toBe(false);
+    await store.dispose();
+    await devices.dispose();
+
+    const recreated = await createDeviceTokenStore(home);
+    expect(recreated.has(token)).toBe(false);
+    await recreated.dispose();
   });
 
   it('isValid accepts the token', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
-    const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined });
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash: undefined,
+    });
     expect(await svc.isValid(store.getToken())).toBe(true);
     await store.dispose();
+    await devices.dispose();
   });
 
   it('isValid accepts the password when a hash is configured', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
     const passwordHash = await resolvePasswordHash({
       KIMI_CODE_PASSWORD: 'correct horse battery staple',
     });
-    const svc = createAuthTokenService({ tokenStore: store, passwordHash });
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash,
+    });
     expect(await svc.isValid('correct horse battery staple')).toBe(true);
     await store.dispose();
+    await devices.dispose();
   });
 
   it('isValid rejects a wrong candidate', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
     const passwordHash = await resolvePasswordHash({
       KIMI_CODE_PASSWORD: 'correct horse battery staple',
     });
-    const svc = createAuthTokenService({ tokenStore: store, passwordHash });
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash,
+    });
     expect(await svc.isValid('wrong')).toBe(false);
     await store.dispose();
+    await devices.dispose();
   });
 
   it('isValid accepts only the token when passwordHash is undefined', async () => {
     const store = await createTokenStore(join(tmpDir, 'home'));
-    const svc = createAuthTokenService({ tokenStore: store, passwordHash: undefined });
+    const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
+    const svc = createAuthTokenService({
+      tokenStore: store,
+      deviceTokenStore: devices,
+      passwordHash: undefined,
+    });
     expect(await svc.isValid(store.getToken())).toBe(true);
     expect(await svc.isValid('any-password')).toBe(false);
     await store.dispose();
+    await devices.dispose();
   });
 });

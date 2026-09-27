@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 
 import { createDecorator } from '@moonshot-ai/agent-core-v2';
 
+import type { DeviceTokenStore } from './deviceTokenStore';
 import { verifyPassword } from './password';
 import type { TokenStore } from './tokenStore';
 
@@ -25,7 +26,9 @@ export interface IAuthTokenService {
 
   createPairingCode(): string;
 
-  exchangePairingCode(code: string): PairingExchange | undefined;
+  exchangePairingCode(code: string): Promise<PairingExchange | undefined>;
+
+  revokeDeviceToken(candidate: string): Promise<boolean>;
 }
 
 export const IAuthTokenService =
@@ -33,11 +36,11 @@ export const IAuthTokenService =
 
 export function createAuthTokenService(deps: {
   readonly tokenStore: TokenStore;
+  readonly deviceTokenStore: DeviceTokenStore;
   readonly passwordHash: string | undefined;
   readonly now?: () => number;
 }): IAuthTokenService {
   const pairingCodes = new Map<string, PairingCode>();
-  const deviceTokens = new Set<string>();
   const now = deps.now ?? Date.now;
   const removeExpired = (): void => {
     const current = now();
@@ -51,7 +54,7 @@ export function createAuthTokenService(deps: {
     getToken: () => deps.tokenStore.getToken(),
     isValid: async (candidate) =>
       deps.tokenStore.isValid(candidate) ||
-      deviceTokens.has(candidate) ||
+      deps.deviceTokenStore.has(candidate) ||
       (await verifyPassword(candidate, deps.passwordHash)),
     createPairingCode: () => {
       removeExpired();
@@ -59,14 +62,15 @@ export function createAuthTokenService(deps: {
       pairingCodes.set(code, { expiresAt: now() + PAIRING_CODE_TTL_MS });
       return code;
     },
-    exchangePairingCode: (code) => {
+    exchangePairingCode: async (code) => {
       removeExpired();
       const pairing = pairingCodes.get(code);
       if (pairing === undefined) return undefined;
       pairingCodes.delete(code);
       const token = randomBytes(32).toString('base64url');
-      deviceTokens.add(token);
+      await deps.deviceTokenStore.add(token);
       return { token, scope: 'device' };
     },
+    revokeDeviceToken: (candidate) => deps.deviceTokenStore.revoke(candidate),
   };
 }

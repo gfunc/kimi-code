@@ -29,6 +29,7 @@ export interface NotificationsConfig {
   readonly ntfyUrl: string;
   readonly topic?: string;
   readonly token?: string;
+  readonly subscriptionToken?: string;
   readonly minPriority: number;
   readonly events: readonly NotificationEvent[];
 }
@@ -47,6 +48,7 @@ export const notificationsConfigSchema = z.object({
   ntfyUrl: z.string().catch(DEFAULT_NTFY_URL).default(DEFAULT_NTFY_URL),
   topic: z.string().optional().catch(undefined),
   token: z.string().optional().catch(undefined),
+  subscriptionToken: z.string().optional().catch(undefined),
   minPriority: z
     .number()
     .catch(1)
@@ -87,6 +89,7 @@ export const notificationsEnvBindings: EnvBindings<NotificationsConfig> = envBin
     ntfyUrl: 'KIMI_CODE_NTFY_URL',
     topic: 'KIMI_CODE_NTFY_TOPIC',
     token: 'KIMI_CODE_NTFY_TOKEN',
+    subscriptionToken: 'KIMI_CODE_NTFY_SUBSCRIPTION_TOKEN',
     minPriority: { env: 'KIMI_CODE_NTFY_MIN_PRIORITY', parse: parseMinPriority },
     events: { env: 'KIMI_CODE_NTFY_EVENTS', parse: parseEvents },
   },

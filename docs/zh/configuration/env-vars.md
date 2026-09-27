@@ -140,6 +140,13 @@ kimi
 | --- | --- | --- |
 | `KIMI_DISABLE_TELEMETRY` | 关闭匿名遥测上报 | `1`、`true`、`yes`、`y`（不区分大小写） |
 | `KIMI_CODE_PASSWORD` | 为 `kimi web` 本地服务设置并列鉴权密码；绑到非本机地址时建议设置，见 [安全注意](../guides/web.md#安全注意) | 任意非空字符串；未设置时仅 token 有效 |
+| `KIMI_CODE_NTFY_ENABLED` | 开启或关闭 `[notifications]` 的 ntfy 推送，优先级高于 `config.toml`（见 [ntfy 推送通知](../guides/web.md#ntfy-推送通知-实验功能)） | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |
+| `KIMI_CODE_NTFY_URL` | `[notifications]` 使用的 ntfy 服务器 URL，优先级高于 `ntfy_url` | URL；默认 `https://ntfy.sh` |
+| `KIMI_CODE_NTFY_TOPIC` | 服务端发布到的 ntfy 主题，优先级高于 `topic` | 非空字符串 |
+| `KIMI_CODE_NTFY_TOKEN` | 服务端发布时使用的 ntfy 访问令牌，优先级高于 `token`；绝不通过 API 暴露 | ntfy 访问令牌 |
+| `KIMI_CODE_NTFY_SUBSCRIPTION_TOKEN` | 经 `GET /api/v1/notifications/config` 提供给订阅方客户端（如手机 App）的 ntfy 访问令牌，优先级高于 `subscription_token` | ntfy 访问令牌 |
+| `KIMI_CODE_NTFY_MIN_PRIORITY` | 发布的最低 ntfy 优先级，优先级高于 `min_priority` | `1` 到 `5` 的整数；非法值被忽略 |
+| `KIMI_CODE_NTFY_EVENTS` | 要发布的事件列表，优先级高于 `events` | 逗号分隔的事件名，如 `approval.requested,work.finished`；无法识别的条目被忽略 |
 | `KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT` | 会话关闭时是否保留后台任务，优先级高于 `config.toml`。默认会在退出时停止后台任务 | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |
 | `KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS` | 同时运行的后台任务数上限，优先级高于 `config.toml` 的 `[background] max_running_tasks`；不设置表示无上限 | 正整数；非法值被忽略 |
 | `KIMI_CODE_BACKGROUND_BASH_TASK_TIMEOUT_S` | 后台 `Bash` 任务的默认超时（秒），也用于前台命令转入后台后的重新计时，优先级高于 `[task] bash_task_timeout_s`；`0` 表示无超时 | 非负整数；非法值被忽略 |
@@ -160,6 +167,7 @@ kimi
 | `KIMI_CODE_REPEAT_BREAKER` | 同一工具调用连续重复多次时，是否注入提醒并最终强制停止该轮。未设置时保持开启 | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off`；其他值忽略 |
 | `KIMI_CODE_EXPERIMENTAL_SUBAGENT_FORK` | 在 `Agent`/`AgentSwarm` 上启用实验性 `fork` 参数：以调用方对话历史快照而非空上下文启动 subagent | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |
 | `KIMI_CODE_EXPERIMENTAL_TOOL_SELECT` | 启用实验性按需加载工具：标记 `deferred: true` 的 MCP server 工具不进入顶层工具列表，由模型经 `select_tools` 按需加载；还需模型声明 `dynamically_loaded_tools` 能力，详见 [MCP](../customization/mcp.md#按需加载工具) | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |
+| `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS` | 启用本地服务的实验性 ntfy 推送通知，见 [ntfy 推送通知](../guides/web.md#ntfy-推送通知-实验功能) | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |
 | `KIMI_CODE_WATCH` | 是否挂文件系统 watch 以热更新配置和工作区文件，优先级高于 `[watch] enabled`（默认 `true`） | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |
 | `KIMI_CODE_SEARCH_WORKER` | 在独立 worker 线程中运行全局搜索索引，优先级高于 `[database] search`（默认 `true`） | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |
 | `KIMI_CODE_PERSISTENCE_MINIDB_READMODEL` | 会话索引使用基于 minidb 的读模型，优先级高于 `[database] base`（默认 `true`） | 真值：`1`/`true`/`yes`/`on`；假值：`0`/`false`/`no`/`off` |

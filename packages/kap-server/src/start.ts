@@ -88,6 +88,7 @@ import { createRemoteControlManager } from '@moonshot-ai/remote-control';
 import { createAuthTokenService, type IAuthTokenService } from './services/auth/authTokenService';
 import { registerPairingRoutes } from './routes/pairing';
 import { createCredentialValidator } from './services/auth/credentials';
+import { createDeviceTokenStore, type DeviceTokenStore } from './services/auth/deviceTokenStore';
 import { resolvePasswordHash } from './services/auth/password';
 import { createTokenStore } from './services/auth/tokenStore';
 
@@ -185,14 +186,20 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
   const configPath = resolveConfigPath({ homeDir, configPath: opts.configPath });
   const guiStore = new GuiStoreService(homeDir, logger);
   let authTokenService: IAuthTokenService;
+  let deviceTokenStore: DeviceTokenStore | undefined;
   let passwordConfigured = false;
   if (opts.authTokenService !== undefined) {
     authTokenService = opts.authTokenService;
   } else {
     const tokenStore = await createTokenStore(homeDir);
+    deviceTokenStore = await createDeviceTokenStore(homeDir);
     const passwordHash = await resolvePasswordHash();
     passwordConfigured = passwordHash !== undefined;
-    authTokenService = createAuthTokenService({ tokenStore, passwordHash });
+    authTokenService = createAuthTokenService({
+      tokenStore,
+      deviceTokenStore,
+      passwordHash,
+    });
   }
   const validateCredential = createCredentialValidator(authTokenService, opts.rpcToken);
   const logging = resolveLoggingConfig({ homeDir, env: process.env });
@@ -330,6 +337,7 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     capabilityInstallSubscription.dispose();
     authFailureLimiter?.dispose();
     modelCatalogRefreshScheduler.dispose();
+    await deviceTokenStore?.dispose();
     try {
       await shutdownServerTelemetry(telemetry);
     } catch (error) {

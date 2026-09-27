@@ -9,6 +9,7 @@ import {
   notificationsConfigResponseSchema,
   type NotificationsConfigResponse,
 } from '../src/protocol/rest-notifications';
+import { outputJsonSchema } from '../src/middleware/schema';
 import { type RunningServer, startServer } from '../src/start';
 import { authedFetch } from './helpers/auth';
 import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
@@ -86,6 +87,7 @@ describe('server-v2 /api/v1/notifications/config', () => {
         'enabled = true',
         'topic = "kc-file-topic"',
         'ntfy_url = "https://ntfy.example.test"',
+        'subscription_token = "tk-sub-example"',
         'min_priority = 4',
         'events = ["approval.requested", "question.requested"]',
         '',
@@ -94,8 +96,52 @@ describe('server-v2 /api/v1/notifications/config', () => {
     const data = await getNotifications();
     expect(data.ntfy_url).toBe('https://ntfy.example.test');
     expect(data.topic).toBe('kc-file-topic');
+    expect(data.subscription_token).toBe('tk-sub-example');
     expect(data.min_priority).toBe(4);
     expect(data.events).toEqual(['approval.requested', 'question.requested']);
+  });
+
+  it('exposes the subscription token but never the publish token', async () => {
+    await boot(
+      [
+        '[notifications]',
+        'enabled = true',
+        'topic = "kc-topic"',
+        'token = "tk-publish-secret"',
+        'subscription_token = "tk-sub-public"',
+        '',
+      ].join('\n'),
+    );
+    const res = await authedFetch(server as RunningServer, base, '/api/v1/notifications/config');
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    expect(raw).not.toContain('tk-publish-secret');
+    const body = JSON.parse(raw) as Envelope<NotificationsConfigResponse>;
+    expect(body.data.subscription_token).toBe('tk-sub-public');
+  });
+
+  it('reports a null subscription token when none is configured', async () => {
+    await boot('[notifications]\nenabled = true\ntopic = "kc-topic"\n');
+    const data = await getNotifications();
+    expect(data.subscription_token).toBeNull();
+  });
+
+  it('keeps subscription_token optional so clients tolerate older servers omitting it', () => {
+    const parse = (data: Record<string, unknown>) => notificationsConfigResponseSchema.safeParse(data);
+    const withoutToken = {
+      enabled: true,
+      flag_enabled: true,
+      ntfy_url: 'https://ntfy.example.test',
+      topic: 'kc-topic',
+      min_priority: 1,
+      events: ['approval.requested'],
+    };
+    expect(parse(withoutToken).success).toBe(true);
+    expect(parse({ ...withoutToken, subscription_token: 'tk-sub' }).success).toBe(true);
+    expect(parse({ ...withoutToken, subscription_token: null }).success).toBe(true);
+
+    const schema = outputJsonSchema(notificationsConfigResponseSchema) as { required?: string[] };
+    expect(schema.required).not.toContain('subscription_token');
   });
 
   it('applies KIMI_CODE_NTFY_* env bindings over the file values', async () => {

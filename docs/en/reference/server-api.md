@@ -20,6 +20,7 @@ All `/api/*` paths (including `/openapi.json` and `/asyncapi.json`) require the 
 
 - `OPTIONS` preflight requests
 - `GET /api/v1/healthz` (liveness probe)
+- `POST /api/v1/pairing/exchange` (exchanges a one-time pairing code for a device token; see [Server and metadata](#server-and-metadata))
 - Static web assets (non-`/api/` paths)
 
 How to carry it: REST uses the `Authorization: Bearer <token>` header; the WebSocket upgrade accepts the same header or the subprotocol `kimi-code.bearer.<token>`. Token generation and rotation are covered in [Using Kimi Code in the browser: Getting started](../guides/web.md#getting-started).
@@ -149,10 +150,12 @@ Endpoints are grouped by resource below. A `:{action}` suffix in a path is the a
 | `GET /api/v1/healthz` | Liveness probe; auth-exempt |
 | `GET /api/v1/meta` | Server version, capability map, `server_id`, experimental flags |
 | `POST /api/v1/shutdown` | Graceful shutdown (replies 200 first); mounted only on loopback binds |
+| `POST /api/v1/pairing/exchange` | Exchange a one-time LAN pairing code for a device bearer token; auth-exempt |
+| `GET /api/v1/notifications/config` | ntfy push-notification coordinates for paired clients (experimental) |
 
 #### `GET /api/v1/healthz`
 
-Liveness probe for scripts and process supervisors. It is the one `/api` endpoint exempt from the bearer token (see [Authentication](#authentication)) and answers without touching config or the engine.
+Liveness probe for scripts and process supervisors. Together with the pairing exchange (see [Authentication](#authentication)), it is exempt from the bearer token and answers without touching config or the engine.
 
 On success, `data` is `{ "ok": true }`.
 
@@ -180,6 +183,32 @@ On success, `data` carries:
 Asks the server to shut down gracefully. The reply is sent first and the shutdown runs immediately after, so the caller can trust the response it received. The route is mounted only on loopback binds — on a non-loopback bind it is not registered at all (requests hit a 404) unless the server was started with `--allow-remote-shutdown`.
 
 On success, `data` is `{ "ok": true }`.
+
+#### `POST /api/v1/pairing/exchange`
+
+Exchanges the one-time pairing code embedded in the `kimi://pair?…` QR printed by `kimi web --host` for a device bearer token — the handshake behind [Pair the Kimi mobile app over LAN](../guides/web.md#pair-the-kimi-mobile-app-over-lan). Codes expire 60 seconds after they are printed and are consumed on first use.
+
+| Parameter | In | Type | Description |
+| --- | --- | --- | --- |
+| `code` | body | string | **Required.** Pairing code from the QR payload |
+
+On success, `data` is `{ token, scope: "device" }`: `token` is the device's bearer token, stored server-side only as a SHA-256 hash in `~/.kimi-code/server/auth/device-tokens.json`, so it keeps working across server restarts. Failure returns HTTP 401 with envelope code `40101` (`Invalid or expired pairing code`) — the code is unknown, expired, or already used.
+
+#### `GET /api/v1/notifications/config`
+
+Returns the ntfy push-notification coordinates that paired clients subscribe with (experimental — requires the `ntfy_notifications` flag, enabled by `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS`; see [Push notifications with ntfy](../guides/web.md#push-notifications-with-ntfy-experimental)). Unlike the pairing exchange, this route requires the bearer token like every other authenticated endpoint.
+
+On success, `data` carries:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | boolean | `true` only when the flag is on, `[notifications].enabled` is `true`, and a `topic` is configured |
+| `flag_enabled` | boolean | Whether the `ntfy_notifications` experimental flag is on |
+| `ntfy_url` | string | ntfy server URL (default `https://ntfy.sh`) |
+| `topic` | string | Topic the server publishes to; `null` when unset |
+| `subscription_token` | string | ntfy access token subscribing clients authenticate with; `null` when unset. The server's publish `token` is never included |
+| `min_priority` | integer | Minimum ntfy priority (1–5) the server publishes |
+| `events` | string[] | Events the server publishes |
 
 ### Login and usage
 

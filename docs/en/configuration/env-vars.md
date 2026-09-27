@@ -140,6 +140,13 @@ Switches that control the behavior of subsystems such as telemetry, background t
 | --- | --- | --- |
 | `KIMI_DISABLE_TELEMETRY` | Disable anonymous telemetry reporting | `1`, `true`, `yes`, `y` (case-insensitive) |
 | `KIMI_CODE_PASSWORD` | Parallel auth credential for `kimi web`, recommended when binding beyond loopback (see [Security notes](../guides/web.md#security-notes)) | Any non-empty string; when unset, only the token is valid |
+| `KIMI_CODE_NTFY_ENABLED` | Turn the `[notifications]` ntfy push feature on or off; higher priority than `config.toml` (see [Push notifications with ntfy](../guides/web.md#push-notifications-with-ntfy-experimental)) | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |
+| `KIMI_CODE_NTFY_URL` | ntfy server URL for `[notifications]`; higher priority than `ntfy_url` | URL; default `https://ntfy.sh` |
+| `KIMI_CODE_NTFY_TOPIC` | ntfy topic the server publishes to; higher priority than `topic` | Non-empty string |
+| `KIMI_CODE_NTFY_TOKEN` | ntfy token the server publishes with; higher priority than `token`; never exposed through the API | ntfy access token |
+| `KIMI_CODE_NTFY_SUBSCRIPTION_TOKEN` | ntfy token handed to subscribing clients (such as the mobile app) via `GET /api/v1/notifications/config`; higher priority than `subscription_token` | ntfy access token |
+| `KIMI_CODE_NTFY_MIN_PRIORITY` | Minimum ntfy priority to publish; higher priority than `min_priority` | Integer from `1` to `5`; invalid values are ignored |
+| `KIMI_CODE_NTFY_EVENTS` | Events to publish; higher priority than `events` | Comma-separated event names, e.g. `approval.requested,work.finished`; unrecognized entries are dropped |
 | `KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT` | Keep background tasks when the session closes; higher priority than `config.toml` (default: stop them on exit) | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |
 | `KIMI_CODE_BACKGROUND_MAX_RUNNING_TASKS` | Cap on concurrently running background tasks; higher priority than `[background] max_running_tasks` (unset = no cap) | Positive integer; invalid values are ignored |
 | `KIMI_CODE_BACKGROUND_BASH_TASK_TIMEOUT_S` | Default timeout (seconds) for background `Bash` tasks, also used to re-arm foreground commands moved to the background; higher priority than `[task] bash_task_timeout_s` (`0` = no timeout) | Non-negative integer; invalid values are ignored |
@@ -160,6 +167,7 @@ Switches that control the behavior of subsystems such as telemetry, background t
 | `KIMI_CODE_REPEAT_BREAKER` | Whether repeating the same tool call many times in a row injects reminders and eventually force-stops the turn. Unset keeps this on | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off`; any other value is ignored |
 | `KIMI_CODE_EXPERIMENTAL_SUBAGENT_FORK` | Experimental `fork` parameter on `Agent`/`AgentSwarm`: start the subagent from a snapshot of the caller's history instead of an empty context; `KIMI_CODE_EXPERIMENTAL_FLAG=1` also enables it | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |
 | `KIMI_CODE_EXPERIMENTAL_TOOL_SELECT` | Experimental on-demand tool loading: tools of MCP servers marked `deferred: true` stay out of the top-level tool list and are loaded via `select_tools`; also requires the model to declare the `dynamically_loaded_tools` capability — see [MCP](../customization/mcp.md#loading-tools-on-demand) | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |
+| `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS` | Enable the local server's experimental ntfy push notifications; see [Push notifications with ntfy](../guides/web.md#push-notifications-with-ntfy-experimental) | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |
 | `KIMI_CODE_WATCH` | Attach filesystem watchers that reload config and workspace files; higher priority than `[watch] enabled` (default `true`) | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |
 | `KIMI_CODE_SEARCH_WORKER` | Run the global search index in a dedicated worker thread; higher priority than `[database] search` (default `true`) | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |
 | `KIMI_CODE_PERSISTENCE_MINIDB_READMODEL` | Use the minidb-backed read model for session indexing; higher priority than `[database] base` (default `true`) | Truthy: `1`/`true`/`yes`/`on`; falsy: `0`/`false`/`no`/`off` |

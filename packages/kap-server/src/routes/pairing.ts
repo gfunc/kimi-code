@@ -42,7 +42,7 @@ export function registerPairingRoutes(
     },
     async (req, reply) => {
       const { code } = req.body;
-      const exchange = authTokenService.exchangePairingCode(code);
+      const exchange = await authTokenService.exchangePairingCode(code);
       const r = reply as unknown as PairingReply;
       if (exchange === undefined) {
         r.code(401).send(errEnvelope(PAIRING_ERROR_CODE, PAIRING_ERROR_MSG, req.id));

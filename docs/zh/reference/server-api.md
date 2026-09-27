@@ -20,6 +20,7 @@
 
 - `OPTIONS` 预检请求
 - `GET /api/v1/healthz`（探活）
+- `POST /api/v1/pairing/exchange`（用一次性配对码换设备 token；见[服务与元信息](#服务与元信息)）
 - 静态 web 资源（非 `/api/` 路径）
 
 携带方式：REST 用 `Authorization: Bearer <token>` 请求头；WebSocket 升级请求接受同一请求头，或子协议 `kimi-code.bearer.<token>`。token 的生成与轮换见 [在网页中使用：开始使用](../guides/web.md#开始使用)。
@@ -149,10 +150,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `GET /api/v1/healthz` | 探活，免鉴权 |
 | `GET /api/v1/meta` | 服务版本、能力集、`server_id`、实验开关 |
 | `POST /api/v1/shutdown` | 优雅退出（先回 200 再关闭）；仅 loopback 绑定时挂载 |
+| `POST /api/v1/pairing/exchange` | 用一次性局域网配对码换取设备 bearer token；免鉴权 |
+| `GET /api/v1/notifications/config` | 给已配对客户端的 ntfy 推送配置（实验功能） |
 
 #### `GET /api/v1/healthz`
 
-供脚本与进程管理器使用的探活端点。它是唯一豁免 bearer token 的 `/api` 端点（见 [鉴权](#鉴权)），应答时不触碰配置与引擎。
+供脚本与进程管理器使用的探活端点。它与配对交换端点（见 [鉴权](#鉴权)）是仅有的两个免 bearer token 的 `/api` 端点，应答时不触碰配置与引擎。
 
 成功时 `data` 为 `{ "ok": true }`。
 
@@ -180,6 +183,32 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 请求服务优雅退出。响应先发出，随后立即执行关闭，因此调用方可以信任收到的响应。该路由仅在 loopback 绑定时挂载——非 loopback 绑定时它根本不会被注册（请求得到 404），除非服务以 `--allow-remote-shutdown` 启动。
 
 成功时 `data` 为 `{ "ok": true }`。
+
+#### `POST /api/v1/pairing/exchange`
+
+用 `kimi web --host` 打印的 `kimi://pair?…` 二维码中的一次性配对码换取设备 bearer token——即[与 Kimi 手机 App 局域网配对](../guides/web.md#与-kimi-手机-app-局域网配对)背后的握手。配对码打印 60 秒后过期，首次使用即被消耗。
+
+| 参数 | 位置 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `code` | body | string | **必填。** 二维码载荷中的配对码 |
+
+成功时 `data` 为 `{ token, scope: "device" }`：`token` 是该设备的 bearer token，服务端只保存它的 SHA-256 哈希（位于 `~/.kimi-code/server/auth/device-tokens.json`），因此跨服务重启依然有效。失败返回 HTTP 401，信封 `code` 为 `40101`（`Invalid or expired pairing code`）——配对码不存在、已过期或已被使用。
+
+#### `GET /api/v1/notifications/config`
+
+返回已配对客户端订阅所需的 ntfy 推送配置（实验功能——需要 `ntfy_notifications` 实验开关，通过 `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS` 启用；见 [ntfy 推送通知](../guides/web.md#ntfy-推送通知-实验功能)）。与配对交换不同，本路由和其他需鉴权端点一样要求 bearer token。
+
+成功时 `data` 携带：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `enabled` | boolean | 仅当实验开关打开、`[notifications].enabled` 为 `true` 且已配置 `topic` 时为 `true` |
+| `flag_enabled` | boolean | `ntfy_notifications` 实验开关是否打开 |
+| `ntfy_url` | string | ntfy 服务器 URL（默认 `https://ntfy.sh`） |
+| `topic` | string | 服务端发布到的主题；未设置时为 `null` |
+| `subscription_token` | string | 订阅方客户端鉴权用的 ntfy 访问令牌；未设置时为 `null`。服务端的发布 `token` 永远不会包含在内 |
+| `min_priority` | integer | 服务端发布的最低 ntfy 优先级（1–5） |
+| `events` | string[] | 服务端发布的事件列表 |
 
 ### 登录与用量
 

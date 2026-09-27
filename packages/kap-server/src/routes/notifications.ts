@@ -27,7 +27,10 @@ export function registerNotificationsRoutes(app: RouteHost, core: Scope): void {
       method: 'GET',
       path: '/notifications/config',
       success: { data: notificationsConfigResponseSchema },
-      description: 'Get the ntfy push notification coordinates for paired clients (experimental)',
+      description:
+        'Get the ntfy push notification coordinates for paired clients (experimental). ' +
+        '`subscription_token` is the ntfy access token clients subscribe with; it is only ' +
+        'returned over this bearer-authenticated route. The server publish token is never exposed.',
       tags: ['notifications'],
     },
     async (req, reply) => {
@@ -41,6 +44,7 @@ export function registerNotificationsRoutes(app: RouteHost, core: Scope): void {
         flag_enabled: flagEnabled,
         ntfy_url: section.ntfyUrl,
         topic: topic ?? null,
+        subscription_token: section.subscriptionToken ?? null,
         min_priority: section.minPriority,
         events: [...section.events],
       };

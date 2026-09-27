@@ -398,6 +398,32 @@ describe('NotificationsService', () => {
     expect(resolution.priority).toBe(1);
   });
 
+  it('carries the interaction deep link as structured dismissal metadata', async () => {
+    const harness = await startHarness();
+    harness.sessions.add(harness.session);
+    harness.interactions.enqueue(interaction('a1', 'approval', 's1', {}));
+    harness.interactions.enqueue(interaction('q1', 'question', 's1', {}));
+    harness.interactions.respond('a1', { decision: 'approved', scope: 'session' });
+    harness.interactions.respond('q1', { answers: [] });
+
+    const clicks = harness.client.published
+      .filter((message) => message.title === 'Resolved')
+      .map((message) => message.click);
+    expect(clicks).toEqual(['kimi://session/s1/approval/a1', 'kimi://session/s1/question/q1']);
+  });
+
+  it('omits the dismissal click when the interaction has no session tag', async () => {
+    const harness = await startHarness();
+    harness.sessions.add(harness.session);
+    const untagged = { ...interaction('a1', 'approval', 's1', {}), tags: {} };
+    harness.interactions.enqueue(untagged);
+    harness.interactions.respond('a1', { decision: 'approved', scope: 'session' });
+
+    const resolution = harness.client.published.at(-1)!;
+    expect(resolution.title).toBe('Resolved');
+    expect(resolution.click).toBeUndefined();
+  });
+
   it('stays inert while the experimental flag is off', async () => {
     const harness = await startHarness({ flagEnabled: false });
     harness.sessions.add(harness.session);

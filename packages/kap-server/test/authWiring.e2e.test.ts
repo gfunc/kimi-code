@@ -141,6 +141,45 @@ describe('production auth wiring', () => {
     expect(gated.status).toBe(200);
   });
 
+  it('keeps exchanged device tokens valid across a restart', async () => {
+    const code = (server as RunningServer).authTokenService.createPairingCode();
+    const response = await fetch(`${base}/api/v1/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { data: { token: string } };
+    const deviceToken = body.data.token;
+
+    await (server as RunningServer).close();
+    await boot();
+
+    const persisted = await fetch(`${base}/api/v1/auth`, {
+      headers: { Authorization: `Bearer ${deviceToken}` },
+    });
+    expect(persisted.status).toBe(200);
+
+    const replay = await fetch(`${base}/api/v1/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    expect(replay.status).toBe(401);
+
+    const raw = await readFile(
+      join(home as string, 'server', 'auth', 'device-tokens.json'),
+      'utf8',
+    );
+    expect(raw).not.toContain(deviceToken);
+  });
+
+  it.skipIf(process.platform === 'win32')('stores device tokens in a 0600 file inside a 0700 dir', async () => {
+    const p = join(home as string, 'server', 'auth', 'device-tokens.json');
+    expect((await stat(p)).mode & 0o777).toBe(0o600);
+    expect((await stat(join(home as string, 'server', 'auth'))).mode & 0o777).toBe(0o700);
+  });
+
   it('gates HTTP: 200 with the token, 401 without', async () => {
     const token = (await readFile(join(home as string, 'server.token'), 'utf8')).trim();
 

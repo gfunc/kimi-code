@@ -78,9 +78,48 @@ Web 支持的斜杠命令见上文 [常用斜杠命令](#常用斜杠命令)，�
 
 </div>
 
+## 与 Kimi 手机 App 局域网配对
+
+使用 `--host` 启动服务后，启动横幅还会打印一张配对二维码：用 Kimi 手机 App 扫码，即可免输地址和 token 直接连上这台服务器。二维码编码的是 `kimi://pair?…` 载荷——本机的局域网地址与端口、一次性配对码和机器名——并会在数据目录写入一张 PNG 备用图（横幅中的 `QR PNG:` 路径），终端里二维码扫不出来时可以打开这张图。
+
+配对码刻意设计得很短命：横幅打印 60 秒后过期，且只能使用一次，第二台设备或第二次尝试都需要新的配对码。想不重启服务就换一张二维码，执行横幅 `Reprint:` 一行给出的命令（`kill -USR2 <pid>`）即可。该提示只在 macOS 和 Linux 上出现——Windows 没有对应的信号——而且二维码只随完整启动横幅打印：保持服务日志关闭（默认即关闭），并注意 `--remote-control` 模式与 `--dangerous-bypass-auth` 下不会打印。
+
+配对可以跨重启保留。扫码成功后，App 会用配对码换到一枚设备 token，之后每次连接都复用它；服务端只保存它的 SHA-256 哈希，位于 `~/.kimi-code/server/auth/device-tokens.json`（`0700` 目录下的 `0600` 文件）。服务重启和 `kimi web rotate-token` 都不会使它失效——想让所有设备解除配对，删除该文件并重启服务即可。
+
+::: warning 注意
+所有流量在局域网上都以明文 HTTP 传输——除非你在服务前面自建 TLS 卸载反向代理，否则没有 TLS。任何在 60 秒窗口内扫到二维码的人都能配对一台设备，同一网络中的窃听者也能读到之后的通信内容。请只在可信网络中配对。`KIMI_CODE_PASSWORD` 是另一种 bearer 凭证，并非配对时的第二道门槛。
+:::
+
+## ntfy 推送通知（实验功能）
+
+服务可以把需要关注的事件——审批请求、提问、轮次结束、Agent 出错、远程控制连接/断开——发布到 [ntfy](https://ntfy.sh) 主题（topic，一种推送通知的发布/订阅服务），这样手机 App 退到后台也能收到审批提醒。该功能是实验性的，默认关闭：设置 `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS=1`（或 `KIMI_CODE_EXPERIMENTAL_FLAG=1`）启用。
+
+配置位于 `config.toml` 的 `[notifications]` 表——注意别与 `tui.toml` 里控制桌面通知的 `[notifications]` 表混淆：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `enabled` | `boolean` | 总开关；实验开关同时打开且 `topic` 已设置时推送才会激活 |
+| `ntfy_url` | `string` | ntfy 服务器 URL；默认 `https://ntfy.sh` |
+| `topic` | `string` | 发布目标主题名；推送激活的必要条件 |
+| `token` | `string` | 服务端发布时使用的 ntfy 访问令牌；只从配置读取，绝不通过 API 暴露 |
+| `subscription_token` | `string` | 给订阅方客户端（如手机）使用的 ntfy 访问令牌；仅通过 `GET /api/v1/notifications/config` 提供 |
+| `min_priority` | `integer` | 发布的最低 ntfy 优先级（1–5）；默认 `1` |
+| `events` | `string[]` | 要发布的事件；默认全部 |
+
+```toml
+# ~/.kimi-code/config.toml
+[notifications]
+enabled = true
+topic = "a-hard-to-guess-topic"
+subscription_token = "ntfy access token for your phone"
+```
+
+每个字段都有同名的环境变量覆盖（`KIMI_CODE_NTFY_ENABLED`、`KIMI_CODE_NTFY_URL`、`KIMI_CODE_NTFY_TOPIC`、`KIMI_CODE_NTFY_TOKEN`、`KIMI_CODE_NTFY_SUBSCRIPTION_TOKEN`、`KIMI_CODE_NTFY_MIN_PRIORITY`、`KIMI_CODE_NTFY_EVENTS`）——见[环境变量](../configuration/env-vars.md)。订阅方客户端从需要鉴权的 `GET /api/v1/notifications/config` 端点读取主题与 `subscription_token`；服务端自己的发布 `token` 永远不会出现在响应里。使用公共 ntfy 服务器时，请选一个难以猜中的主题名——任何知道主题名的人都能订阅。
+
 ## 安全注意
 
 - **建议设置并列凭证**：绑定局域网地址后，额外设置 `KIMI_CODE_PASSWORD` 环境变量，服务端会对鉴权失败自动限流。
+- **默认局域网流量可被窃听**：绑定到非本机地址后服务以明文 HTTP 运行——配对交换和之后的全部流量都能被同一网络中的任何人观察到（见[与 Kimi 手机 App 局域网配对](#与-kimi-手机-app-局域网配对)）。
 - **不要彻底关闭鉴权**：`--dangerous-bypass-auth` 会关闭所有鉴权，任何能访问该端口的人都能控制你的会话、文件系统和 shell。仅在可信网络或自有鉴权代理之后使用，详见 [kimi 命令参考](../reference/kimi-command.md#kimi-web)。
 
 
@@ -101,6 +140,10 @@ Web 支持的斜杠命令见上文 [常用斜杠命令](#常用斜杠命令)，�
 ### 同一 WiFi 下其他设备访问不到
 
 确认启动时带了 `--host`（裸写即可），并用横幅中局域网地址（形如 `http://192.168.x.x:58627/#token=...`）访问。仍不通时检查电脑防火墙是否放行了该端口，以及两台设备是否真的在同一网段（访客 WiFi、VPN、4G/5G 热点切换都会造成隔离）。
+
+### 手机 App 提示配对码无效
+
+配对码在横幅打印 60 秒后过期，且只能使用一次，所以旧二维码（或同一张码扫第二次）会被拒绝。用 `Reprint:` 命令（`kill -USR2 <pid>`）重新打印横幅，再扫新的二维码。之前配对成功的手机在服务重启和 `kimi web rotate-token` 之后依然可用——只有 `server/auth/device-tokens.json` 被删除后才需要重新配对。
 
 ## 下一步
 
