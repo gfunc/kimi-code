@@ -70,7 +70,7 @@ function waitClose(ws: WebSocket, timeoutMs = 3000): Promise<void> {
 async function pollUntil(probe: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (probe()) return;
+    if (await probe()) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error('condition was not met within timeout');
@@ -413,5 +413,20 @@ describe('production auth wiring', () => {
     server = undefined;
     await new Promise((resolve) => setTimeout(resolve, 250));
     await boot();
+  });
+});
+
+describe('pollUntil', () => {
+  it('times out when an async probe keeps returning false', async () => {
+    await expect(pollUntil(async () => false, 250)).rejects.toThrow('condition was not met within timeout');
+  });
+
+  it('keeps polling until an async probe turns true', async () => {
+    let calls = 0;
+    await pollUntil(async () => {
+      calls += 1;
+      return calls >= 3;
+    }, 2000);
+    expect(calls).toBeGreaterThanOrEqual(3);
   });
 });
