@@ -25,6 +25,8 @@
 
 携带方式：REST 用 `Authorization: Bearer <token>` 请求头；WebSocket 升级请求接受同一请求头，或子协议 `kimi-code.bearer.<token>`。token 的生成与轮换见 [在网页中使用：开始使用](../guides/web.md#开始使用)。
 
+可接受的凭据分四类，携带方式完全相同：服务端 token、已配对的设备 token、密码（`KIMI_CODE_PASSWORD`），以及发放给宿主机侧集成的 RPC token。四者开放的 API 面完全一致——设备 token 只是身份标签，不是受限权限：它和其他凭据一样可以创建会话、提交能调用 shell 工具的提示词、管理文件、插件和 MCP 服务。REST 面上的例外是 host-only 路由——`POST /api/v1/shutdown` 与 [设备管理](#设备管理)：它们接受服务端 token、密码和 RPC token，但设备 token 会被拒绝，返回 HTTP 403，信封 `code` 为 `40302`。这一拒绝是 REST 行为：调试 WebSocket `/api/v1/debug/ws`（仅 `--debug-endpoints` 且 loopback 时挂载，不属于稳定协议）同样拒绝设备 token，但那里的 WebSocket 升级请求只会得到不带信封的 HTTP 401。
+
 鉴权失败返回 HTTP 401，信封 `code` 为 `40101`。在非 loopback 绑定上，同一来源 60 秒内鉴权失败 10 次会被封禁 60 秒，期间每个请求都返回 HTTP 429（`code` 为 `42901`）。
 
 ### 响应信封
@@ -65,7 +67,8 @@ HTTP 状态码几乎总是 200，业务结果以 `code` 为准。例外情况：
 | `0` | 成功 | |
 | `400xx` | 请求参数错误 | `40001` 校验失败（`details` 逐字段说明）、`40003` 供应商由 OAuth 托管 |
 | `401xx` | 鉴权与就绪状态 | `40101` 未授权、`40110` 未配置供应商、`40113` 模型未解析 |
-| `404xx` | 资源不存在 | `40401` 会话、`40408` MCP 服务、`40409` 文件路径 |
+| `403xx` | 禁止访问 | `40302` host-only 路由——不接受设备 token |
+| `404xx` | 资源不存在 | `40401` 会话、`40408` MCP 服务、`40409` 文件路径、`40421` 设备 |
 | `409xx` | 状态冲突 | `40901` 会话忙、`40902` 审批已解决、`40922` 分页条件与 `page_token` 不符 |
 | `410xx` | 资源已过期 | `41001` 审批超时、`41002` 提问超时、`41003` 临时文件过期 |
 | `413xx` | 体积或边界超限 | `41302` 读取文件超 10 MB、`41304` 路径越出会话目录 |
@@ -149,9 +152,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | --- | --- |
 | `GET /api/v1/healthz` | 探活，免鉴权 |
 | `GET /api/v1/meta` | 服务版本、能力集、`server_id`、实验开关 |
-| `POST /api/v1/shutdown` | 优雅退出（先回 200 再关闭）；仅 loopback 绑定时挂载 |
+| `POST /api/v1/shutdown` | 优雅退出（先回 200 再关闭）；仅 loopback 绑定时挂载；需要宿主凭据 |
 | `POST /api/v1/pairing/exchange` | 用一次性局域网配对码换取设备 bearer token；免鉴权 |
 | `GET /api/v1/notifications/config` | 给已配对客户端的 ntfy 推送配置（实验功能） |
+| `GET /api/v1/devices` | 列出已配对的设备 token；需要宿主凭据 |
+| `POST /api/v1/devices/{device_id}:revoke` | 撤销一台已配对设备并关闭其活动连接；需要宿主凭据 |
 
 #### `GET /api/v1/healthz`
 
@@ -168,7 +173,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `server_version` | string | 服务版本 |
-| `capabilities` | object | 能力集——`websocket`、`file_upload`、`fs_query`、`mcp`、`tasks`、`terminal`，均恒为 `true` |
+| `capabilities` | object | 能力集——`websocket`、`file_upload`、`fs_query`、`mcp`、`tasks`、`terminal`，均恒为 `true`；另见下方的 `mobile_api` |
+| `capabilities.mobile_api` | object | 手机 App API 面：`pairing_exchange`、`agent_id_abort`、`plan_control_clear`、`notifications_config`、`device_management`，均恒为 `true`。它只表明这些端点在本服务上存在——不代表任何设备已获授权，也不代表推送通知已启用 |
 | `server_id` | string | 本服务实例的唯一 id |
 | `started_at` | string | 启动时间，ISO 8601 格式 |
 | `open_in_apps` | array | 可作为 `open-in` 目标的宿主应用（`finder` / `cursor` / `vscode` / `iterm` / `terminal`）；目前恒为空 |
@@ -180,7 +186,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 #### `POST /api/v1/shutdown`
 
-请求服务优雅退出。响应先发出，随后立即执行关闭，因此调用方可以信任收到的响应。该路由仅在 loopback 绑定时挂载——非 loopback 绑定时它根本不会被注册（请求得到 404），除非服务以 `--allow-remote-shutdown` 启动。
+请求服务优雅退出。响应先发出，随后立即执行关闭，因此调用方可以信任收到的响应。该路由仅在 loopback 绑定时挂载——非 loopback 绑定时它根本不会被注册（请求得到 404），除非服务以 `--allow-remote-shutdown` 启动。它还需要宿主凭据：设备 token 会被拒绝，返回 HTTP 403，信封 `code` 为 `40302`（见 [鉴权](#鉴权)）。
 
 成功时 `data` 为 `{ "ok": true }`。
 
@@ -192,11 +198,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | --- | --- | --- | --- |
 | `code` | body | string | **必填。** 二维码载荷中的配对码 |
 
-成功时 `data` 为 `{ token, scope: "device" }`：`token` 是该设备的 bearer token，服务端只保存它的 SHA-256 哈希（位于 `~/.kimi-code/server/auth/device-tokens.json`），因此跨服务重启依然有效。失败返回 HTTP 401，信封 `code` 为 `40101`（`Invalid or expired pairing code`）——配对码不存在、已过期或已被使用。
+成功时 `data` 为 `{ token, scope: "device", device_id }`：`token` 是该设备的 bearer token，服务端只保存它的 SHA-256 哈希（位于 `~/.kimi-code/server/auth/device-tokens.json`），因此跨服务重启依然有效；`device_id` 是这次配对在 [设备列表](#get-api-v1-devices) 中得到的 id。失败返回 HTTP 401，信封 `code` 为 `40101`（`Invalid or expired pairing code`）——配对码不存在、已过期或已被使用。
 
 #### `GET /api/v1/notifications/config`
 
-返回已配对客户端订阅所需的 ntfy 推送配置（实验功能——需要 `ntfy_notifications` 实验开关，通过 `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS` 启用；见 [ntfy 推送通知](../guides/web.md#ntfy-推送通知-实验功能)）。与配对交换不同，本路由和其他需鉴权端点一样要求 bearer token。
+返回已配对客户端订阅所需的 ntfy 推送配置（实验功能——需要 `ntfy_notifications` 实验开关，通过 `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS` 启用；见 [ntfy 推送通知](../guides/web.md#ntfy-推送通知-实验功能)）。与配对交换不同，本路由和其他需鉴权端点一样要求 bearer token。载荷字段名为 snake_case——与 [`GET /api/v1/config` 投影](#get-api-v1-config)中同一组设置使用的 camelCase 键不同。
 
 成功时 `data` 携带：
 
@@ -209,6 +215,30 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `subscription_token` | string | 订阅方客户端鉴权用的 ntfy 访问令牌；未设置时为 `null`。服务端的发布 `token` 永远不会包含在内 |
 | `min_priority` | integer | 服务端发布的最低 ntfy 优先级（1–5） |
 | `events` | string[] | 服务端发布的事件列表 |
+
+### 设备管理
+
+这组端点管理经 [配对](#post-api-v1-pairing-exchange) 发放的设备 token。它们是 host-only 路由（见 [鉴权](#鉴权)）：接受服务端 token、密码和 RPC token，设备 token 则会收到 HTTP 403，信封 `code` 为 `40302`。
+
+#### `GET /api/v1/devices`
+
+列出与本服务配对的设备 token。token 哈希永远不会返回。
+
+成功时 `data` 为 `{ devices }`，每项形如 `{ device_id, created_at }`——即 `:revoke` 所用的设备 id，以及配对时间的 ISO 8601 时间戳。
+
+#### `POST /api/v1/devices/{device_id}:revoke`
+
+撤销一个已配对的设备 token。没有请求体。
+
+| 参数 | 位置 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `device_id` | path | string | **必填。** `GET /api/v1/devices` 返回的设备 id |
+
+成功时 `data` 为 `{ device_id, revoked: true }`；id 不存在返回信封 `code` 为 `40421`。撤销的生效方式如下：
+
+- 该 token 立即失去鉴权效力：之后所有携带它的 REST 请求都返回 HTTP 401（`40101`）。
+- 在处理本次撤销的实例上，以该 token 鉴权的活动 WebSocket 连接会立即以 close code `4401` 关闭；共享同一 home 目录的其他实例约每 30 秒复核一次连接凭据，届时同样关闭（见 [建立连接](#建立连接)）。
+- `kimi web rotate-token` 不会撤销设备——轮换只替换服务端 token。
 
 ### 登录与用量
 
@@ -307,9 +337,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 #### `GET /api/v1/config`
 
-返回解析后的全局配置——`config.toml` 叠加覆盖层后的生效结果。密钥已脱敏：每个供应商只报告 `has_api_key`，绝不返回存储的密钥。
+返回解析后的全局配置——`config.toml` 叠加覆盖层后的生效结果。密钥已脱敏：每个供应商只报告 `has_api_key`，绝不返回存储的密钥；`notifications` 域也只投影出安全字段——ntfy 的发布 `token` 与 `subscription_token` 既不会出现在本响应中，也不会出现在 `event.config.changed` 事件与 debug 配置 RPC 中；订阅令牌仅由 `GET /api/v1/notifications/config` 提供。注意该投影保留此域的 camelCase 键（`ntfyUrl`、`minPriority`）；专门的 `GET /api/v1/notifications/config` 路由则以 snake_case 字段名（`ntfy_url`、`min_priority`）报告同一组设置。
 
-成功时 `data` 为配置对象；其字段与 [顶层字段](../configuration/config-files.md#top-level-fields) 记录的顶层域一一对应：
+成功时 `data` 为配置对象；其字段与 [顶层字段](../configuration/config-files.md#顶层字段) 记录的顶层域一一对应：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -332,6 +362,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | `subagent` | object | subagent 配置 |
 | `secondary_model` | object | subagent 的次级模型池 |
 | `experimental` | object | 实验开关 id → 是否启用 |
+| `notifications` | object | ntfy 推送设置（见 [ntfy 推送通知](../guides/web.md#ntfy-推送通知-实验功能)）——只有 `enabled`、`ntfyUrl`、`topic`、`minPriority`、`events`；ntfy 令牌永远不会包含在内 |
 | `telemetry` | boolean | 是否启用匿名遥测 |
 | `auto_session_title` | boolean | 是否允许客户端自动生成会话标题 |
 | `raw` | object | 原始解析的 `config.toml` 内容，包含未建模字段 |
@@ -2378,13 +2409,14 @@ locator 寻址的目录（脱敏配置），外加对每个 OAuth 候选的批�
   "payload": {
     "ws_connection_id": "conn_01JZX4...",
     "protocol_version": 2,
+    "heartbeat_ms": 10000,
     "max_event_buffer_size": 1000,
     "capabilities": { "event_batching": false, "compression": false }
   }
 }
 ```
 
-注意服务端不发送心跳，也不会主动断开空闲连接——保活与重连由客户端自己负责。
+服务端会为每条连接做心跳：每 10 秒发送一帧 `ping`（间隔在 `server_hello` 的 `heartbeat_ms` 中告知），并会在连续两个心跳间隔（约 20 秒）内没有收到任何入站帧时关闭该连接，close code 为 `1001`（`heartbeat timeout`）。任何入站帧——`pong` 应答、ack 或其他帧——都会重置计时，因此只接收事件的客户端应当对每个 `ping` 回复 `pong`；重连仍由客户端自己负责。另一类服务端主动关闭是凭据被撤销：以不再有效的服务端或设备 token 鉴权的连接会被服务端主动关闭，close code 为 `4401`（`credential revoked`）。凭据约每 30 秒复核一次，因此在某个实例处理完设备 `:revoke`（该实例立即关闭该设备的连接）或执行 `kimi web rotate-token` 之后，受影响的连接都会在这个时间窗内被各实例关闭。
 
 ### 控制帧
 

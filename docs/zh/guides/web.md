@@ -80,14 +80,14 @@ Web 支持的斜杠命令见上文 [常用斜杠命令](#常用斜杠命令)，�
 
 ## 与 Kimi 手机 App 局域网配对
 
-使用 `--host` 启动服务后，启动横幅还会打印一张配对二维码：用 Kimi 手机 App 扫码，即可免输地址和 token 直接连上这台服务器。二维码编码的是 `kimi://pair?…` 载荷——本机的局域网地址与端口、一次性配对码和机器名——并会在数据目录写入一张 PNG 备用图（横幅中的 `QR PNG:` 路径），终端里二维码扫不出来时可以打开这张图。
+使用 `--host` 启动服务后，启动横幅还会打印一张配对二维码：用 Kimi 手机 App 扫码，即可免输地址和 token 直接连上这台服务器。二维码编码的是 `kimi://pair?…` 载荷——本机的局域网地址与端口、一次性配对码和机器名——并会在数据目录写入一张 PNG 备用图（横幅中的 `QR PNG:` 路径），终端里二维码扫不出来时可以打开这张图。上一次运行遗留的 PNG 会在下次启动时被清理，但要等它远超配对窗口期之后——清理阈值是两个配对窗口期（两分钟），仍可能有效的配对码绝不会被清理——且文件可删除时才会真正删除；清理是尽力而为的，没有保证的时限。
 
-配对码刻意设计得很短命：横幅打印 60 秒后过期，且只能使用一次，第二台设备或第二次尝试都需要新的配对码。想不重启服务就换一张二维码，执行横幅 `Reprint:` 一行给出的命令（`kill -USR2 <pid>`）即可。该提示只在 macOS 和 Linux 上出现——Windows 没有对应的信号——而且二维码只随完整启动横幅打印：保持服务日志关闭（默认即关闭），并注意 `--remote-control` 模式与 `--dangerous-bypass-auth` 下不会打印。
+配对码刻意设计得很短命：横幅打印 60 秒后过期，且只能使用一次，第二台设备或第二次尝试都需要新的配对码。想不重启服务就换一张二维码，用横幅 `Reprint:` 一行给出的触发方式——macOS 和 Linux 上执行 `kill -USR2 <pid>`；Windows 交互式终端里按 `R`。Windows 没有交互式终端时没有重打印触发方式，横幅会改为提示 `restart kimi web`。该提示只随完整启动横幅出现：保持服务日志关闭（默认即关闭），并注意 `--remote-control` 模式与 `--dangerous-bypass-auth` 下不会打印。
 
-配对可以跨重启保留。扫码成功后，App 会用配对码换到一枚设备 token，之后每次连接都复用它；服务端只保存它的 SHA-256 哈希，位于 `~/.kimi-code/server/auth/device-tokens.json`（`0700` 目录下的 `0600` 文件）。服务重启和 `kimi web rotate-token` 都不会使它失效——想让所有设备解除配对，删除该文件并重启服务即可。
+配对可以跨重启保留。扫码成功后，App 会用配对码换到一枚设备 token，之后每次连接都复用它；服务端只保存它的 SHA-256 哈希，位于 `~/.kimi-code/server/auth/device-tokens.json`（`0700` 目录下的 `0600` 文件）。每次配对都会得到一个设备 id，宿主机可以通过设备管理 API 列出已配对设备或撤销某一台（见 [服务 API：设备管理](../reference/server-api.md#设备管理)）——被撤销的设备下一次请求就会收到 HTTP 401，其活动连接也会被关闭。服务重启和 `kimi web rotate-token` 都不会使设备 token 失效——想让所有设备一次性解除配对，删除该文件即可：新请求立即失败，活动连接会在约半分钟内的复核中被关闭。旧版本写入的文件（裸哈希列表）会在启动时自动迁移为按设备记录的格式。
 
 ::: warning 注意
-所有流量在局域网上都以明文 HTTP 传输——除非你在服务前面自建 TLS 卸载反向代理，否则没有 TLS。任何在 60 秒窗口内扫到二维码的人都能配对一台设备，同一网络中的窃听者也能读到之后的通信内容。请只在可信网络中配对。`KIMI_CODE_PASSWORD` 是另一种 bearer 凭证，并非配对时的第二道门槛。
+所有流量在局域网上都以明文 HTTP 传输——除非你在服务前面自建 TLS 卸载反向代理，否则没有 TLS。任何在 60 秒窗口内扫到二维码的人都能配对一台设备，同一网络中的窃听者也能读到之后的通信内容。请只在可信网络中配对。若所用 App 版本支持手动输入 HTTPS/WSS 地址，也可以在 App 里手动输入反代地址，穿过这样的代理完成配对——二维码本身编码的始终是局域网明文地址。这种情况下，手机系统必须信任代理的证书（任意的自签证书不行），且代理转发的 `Host` 头必须通过服务端 `--allowed-host` 检查。`KIMI_CODE_PASSWORD` 是另一种 bearer 凭证，并非配对时的第二道门槛。
 :::
 
 ## ntfy 推送通知（实验功能）
@@ -114,7 +114,7 @@ topic = "a-hard-to-guess-topic"
 subscription_token = "ntfy access token for your phone"
 ```
 
-每个字段都有同名的环境变量覆盖（`KIMI_CODE_NTFY_ENABLED`、`KIMI_CODE_NTFY_URL`、`KIMI_CODE_NTFY_TOPIC`、`KIMI_CODE_NTFY_TOKEN`、`KIMI_CODE_NTFY_SUBSCRIPTION_TOKEN`、`KIMI_CODE_NTFY_MIN_PRIORITY`、`KIMI_CODE_NTFY_EVENTS`）——见[环境变量](../configuration/env-vars.md)。订阅方客户端从需要鉴权的 `GET /api/v1/notifications/config` 端点读取主题与 `subscription_token`；服务端自己的发布 `token` 永远不会出现在响应里。使用公共 ntfy 服务器时，请选一个难以猜中的主题名——任何知道主题名的人都能订阅。
+每个字段都有同名的环境变量覆盖（`KIMI_CODE_NTFY_ENABLED`、`KIMI_CODE_NTFY_URL`、`KIMI_CODE_NTFY_TOPIC`、`KIMI_CODE_NTFY_TOKEN`、`KIMI_CODE_NTFY_SUBSCRIPTION_TOKEN`、`KIMI_CODE_NTFY_MIN_PRIORITY`、`KIMI_CODE_NTFY_EVENTS`）——见 [环境变量](../configuration/env-vars.md)。订阅方客户端从需要鉴权的 `GET /api/v1/notifications/config` 端点读取主题与 `subscription_token`；服务端自己的发布 `token` 既不会出现在该响应里，也不会出现在通用配置响应里。使用公共 ntfy 服务器时，请选一个难以猜中的主题名——任何知道主题名的人都能订阅。发布失败（ntfy 服务器不可达、token 被拒等）只会记录在服务日志里——启动服务时加上 `--log-level info` 才能看到。
 
 ## 安全注意
 
@@ -143,7 +143,7 @@ subscription_token = "ntfy access token for your phone"
 
 ### 手机 App 提示配对码无效
 
-配对码在横幅打印 60 秒后过期，且只能使用一次，所以旧二维码（或同一张码扫第二次）会被拒绝。用 `Reprint:` 命令（`kill -USR2 <pid>`）重新打印横幅，再扫新的二维码。之前配对成功的手机在服务重启和 `kimi web rotate-token` 之后依然可用——只有 `server/auth/device-tokens.json` 被删除后才需要重新配对。
+配对码在横幅打印 60 秒后过期，且只能使用一次，所以旧二维码（或同一张码扫第二次）会被拒绝。用 `Reprint:` 触发方式重新打印横幅（macOS 和 Linux 上执行 `kill -USR2 <pid>`，Windows 交互式终端里按 `R`），再扫新的二维码。之前配对成功的手机在服务重启和 `kimi web rotate-token` 之后依然可用——只有 `server/auth/device-tokens.json` 被删除，或该设备经 API 被撤销后，才需要重新配对。
 
 ## 下一步
 

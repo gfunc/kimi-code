@@ -13,6 +13,7 @@ import {
   IAgentShellCommandService,
   IAppendLogStore,
   IDebugEventsService,
+  IConfigService,
   IEventService,
   IInstantiationService,
   IPluginService,
@@ -693,6 +694,49 @@ describe('server-v2 /api/v1/debug RPC', () => {
     }
     expect(rejected).toBe(true);
     expect(code).not.toBe(0);
+  });
+
+  it('redacts notification credentials from configService getAll/get/inspect', async () => {
+    const config = (server as RunningServer).core.accessor.get(IConfigService);
+    await config.ready;
+    await config.set('notifications', {
+      enabled: true,
+      topic: 'kc-debug-topic',
+      token: 'tk-publish-leak',
+      subscriptionToken: 'tk-sub-leak',
+    });
+    try {
+      const all = await call<Record<string, unknown>>('POST', rpc('core', IConfigService, 'getAll'));
+      expect(all.body.code).toBe(0);
+      expect(JSON.stringify(all.body)).not.toContain('tk-publish-leak');
+      expect(JSON.stringify(all.body)).not.toContain('tk-sub-leak');
+      expect(all.body.data['notifications']).toMatchObject({
+        enabled: true,
+        topic: 'kc-debug-topic',
+      });
+
+      const got = await call<Record<string, unknown>>(
+        'POST',
+        rpc('core', IConfigService, 'get'),
+        'notifications',
+      );
+      expect(got.body.code).toBe(0);
+      expect(JSON.stringify(got.body)).not.toContain('tk-publish-leak');
+      expect(JSON.stringify(got.body)).not.toContain('tk-sub-leak');
+      expect(got.body.data).toMatchObject({ topic: 'kc-debug-topic' });
+
+      const inspected = await call<{ value?: Record<string, unknown> }>(
+        'POST',
+        rpc('core', IConfigService, 'inspect'),
+        'notifications',
+      );
+      expect(inspected.body.code).toBe(0);
+      expect(JSON.stringify(inspected.body)).not.toContain('tk-publish-leak');
+      expect(JSON.stringify(inspected.body)).not.toContain('tk-sub-leak');
+      expect(inspected.body.data.value).toMatchObject({ topic: 'kc-debug-topic' });
+    } finally {
+      await config.replace('notifications', {});
+    }
   });
 
   it('surfaces the originating stack trace on error', async () => {

@@ -3,6 +3,7 @@ import { IConfigService, type Scope } from '@moonshot-ai/agent-core-v2';
 import { errEnvelope, okEnvelope } from '../envelope';
 import { requestLog } from '../lib/requestLog';
 import { defineRoute } from '../middleware/defineRoute';
+import { NOTIFICATIONS_SECTION } from '../services/notifications/configSection';
 import { ErrorCode } from '../protocol/error-codes';
 import { configResponseSchema, patchConfigRequestSchema } from '../protocol/rest-config';
 import type { ConfigResponse } from '../protocol/rest-config';
@@ -86,14 +87,7 @@ export function registerConfigRoutes(app: ConfigRouteHost, core: Scope): void {
 export function toConfigResponse(resolved: Record<string, unknown>): ConfigResponse {
   const wire: Record<string, unknown> = {};
   for (const [domain, value] of Object.entries(resolved)) {
-    wire[camelToSnake(domain)] =
-      domain === 'providers'
-        ? toProviderResponses(value)
-        : domain === 'models'
-          ? toModelResponses(value)
-          : domain === 'services'
-            ? toServiceResponses(value)
-            : value;
+    wire[camelToSnake(domain)] = projectConfigValue(domain, value);
   }
   const defaultPermissionMode = resolved['defaultPermissionMode'];
   if (typeof defaultPermissionMode === 'string') {
@@ -103,6 +97,26 @@ export function toConfigResponse(resolved: Record<string, unknown>): ConfigRespo
     wire['providers'] = {};
   }
   return wire as ConfigResponse;
+}
+
+export function projectConfigValue(domain: string, value: unknown): unknown {
+  if (domain === 'providers') return toProviderResponses(value);
+  if (domain === 'models') return toModelResponses(value);
+  if (domain === 'services') return toServiceResponses(value);
+  if (domain === NOTIFICATIONS_SECTION) return toNotificationsResponse(value);
+  return value;
+}
+
+const NOTIFICATIONS_SAFE_KEYS = ['enabled', 'ntfyUrl', 'topic', 'minPriority', 'events'] as const;
+
+function toNotificationsResponse(value: unknown): Record<string, unknown> {
+  if (!isPlainObject(value)) return {};
+  const projected: Record<string, unknown> = {};
+  for (const key of NOTIFICATIONS_SAFE_KEYS) {
+    const entry = value[key];
+    if (entry !== undefined) projected[key] = entry;
+  }
+  return projected;
 }
 
 interface ProviderLike {

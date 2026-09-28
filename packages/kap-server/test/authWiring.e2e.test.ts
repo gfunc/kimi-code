@@ -52,19 +52,51 @@ function expectRejected(url: string): Promise<void> {
   });
 }
 
+function waitClose(ws: WebSocket, timeoutMs = 3000): Promise<void> {
+  if (ws.readyState === WebSocket.CLOSED) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.removeListener('close', onClose);
+      reject(new Error('connection was not closed within timeout'));
+    }, timeoutMs);
+    const onClose = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.once('close', onClose);
+  });
+}
+
+async function pollUntil(probe: () => boolean | Promise<boolean>, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (probe()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error('condition was not met within timeout');
+}
+
 describe('production auth wiring', () => {
   let server: RunningServer | undefined;
   let home: string | undefined;
   let base: string;
   const sockets: WebSocket[] = [];
+  const extraServers: RunningServer[] = [];
 
   beforeAll(async () => {
     home = await mkdtemp(join(tmpdir(), 'kimi-server-v2-auth-wiring-'));
     await boot();
   });
 
-  async function boot(): Promise<void> {
-    server = await startServer({ hostIdentity: TEST_HOST_IDENTITY, host: '127.0.0.1', port: 0, homeDir: home, logLevel: 'silent' });
+  async function boot(opts?: { wsCredentialRecheckIntervalMs?: number }): Promise<void> {
+    server = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
+      host: '127.0.0.1',
+      port: 0,
+      homeDir: home,
+      logLevel: 'silent',
+      ...opts,
+    });
     base = `http://127.0.0.1:${server.port}`;
   }
 
@@ -78,15 +110,51 @@ describe('production auth wiring', () => {
   });
 
   afterAll(async () => {
+    while (extraServers.length > 0) {
+      await extraServers.pop()!.close();
+    }
     if (server !== undefined) {
       await server.close();
       server = undefined;
     }
     if (home !== undefined) {
-      await rm(home, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as never);
       home = undefined;
     }
   });
+
+  async function serverToken(): Promise<string> {
+    return (await readFile(join(home as string, 'server.token'), 'utf8')).trim();
+  }
+
+  interface PairingResult {
+    token: string;
+    deviceId: string;
+  }
+
+  async function pairDevice(): Promise<PairingResult> {
+    const srv = server as RunningServer;
+    const code = srv.authTokenService.createPairingCode();
+    const response = await fetch(`${base}/api/v1/pairing/exchange`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: { token: string; scope: string; device_id?: string };
+    };
+    expect(typeof body.data.device_id).toBe('string');
+    return { token: body.data.token, deviceId: body.data.device_id! };
+  }
+
+  async function revokeDevice(deviceId: string): Promise<void> {
+    const response = await fetch(`${base}/api/v1/devices/${deviceId}:revoke`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${await serverToken()}` },
+    });
+    expect(response.status).toBe(200);
+  }
 
   it.skipIf(process.platform === 'win32')('writes a 0600 token file at boot and keeps it on close', async () => {
     const p = join(home as string, 'server.token');
@@ -217,5 +285,133 @@ describe('production auth wiring', () => {
     expect(firstFrame).toMatchObject({ type: 'server_hello' });
 
     await expectRejected(wsUrl);
+  });
+
+  it('keeps device management host-only over the real HTTP surface', async () => {
+    const srv = server as RunningServer;
+    const paired = await pairDevice();
+    const token = await serverToken();
+
+    const deviceAuth = await fetch(`${base}/api/v1/auth`, {
+      headers: { authorization: `Bearer ${paired.token}` },
+    });
+    expect(deviceAuth.status).toBe(200);
+
+    const deniedList = await fetch(`${base}/api/v1/devices`, {
+      headers: { authorization: `Bearer ${paired.token}` },
+    });
+    expect(deniedList.status).toBe(403);
+    expect(((await deniedList.json()) as { code: number }).code).toBe(40302);
+
+    const deniedRevoke = await fetch(`${base}/api/v1/devices/${paired.deviceId}:revoke`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${paired.token}` },
+    });
+    expect(deniedRevoke.status).toBe(403);
+
+    const list = await fetch(`${base}/api/v1/devices`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(list.status).toBe(200);
+    const listBody = (await list.json()) as {
+      data: { devices: Array<{ device_id: string; created_at: string }> };
+    };
+    const mine = listBody.data.devices.find((device) => device.device_id === paired.deviceId);
+    expect(mine).toBeDefined();
+    expect(Number.isNaN(new Date(mine!.created_at).getTime())).toBe(false);
+
+    const unknown = await fetch(`${base}/api/v1/devices/dev_unknown:revoke`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as { code: number }).code).toBe(40421);
+
+    await revokeDevice(paired.deviceId);
+    const after = await fetch(`${base}/api/v1/auth`, {
+      headers: { authorization: `Bearer ${paired.token}` },
+    });
+    expect(after.status).toBe(401);
+    expect(srv.port).toBeGreaterThan(0);
+  });
+
+  it('closes a revoked device-token WS in place and leaves the server-token WS alone', async () => {
+    const srv = server as RunningServer;
+    const wsUrl = `ws://127.0.0.1:${srv.port}/api/v1/ws`;
+    const paired = await pairDevice();
+    const token = await serverToken();
+
+    const deviceWs = (await openConn(wsUrl, [`kimi-code.bearer.${paired.token}`])).ws;
+    sockets.push(deviceWs);
+    const hostWs = (await openConn(wsUrl, [`kimi-code.bearer.${token}`])).ws;
+    sockets.push(hostWs);
+
+    await revokeDevice(paired.deviceId);
+
+    await waitClose(deviceWs);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(hostWs.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it('detects a cross-instance revocation on a shared home via periodic recheck', async () => {
+    const srvA = server as RunningServer;
+    const srvB = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
+      host: '127.0.0.1',
+      port: 0,
+      homeDir: home,
+      logLevel: 'silent',
+      wsCredentialRecheckIntervalMs: 25,
+    });
+    extraServers.push(srvB);
+    const paired = await pairDevice();
+    const token = await serverToken();
+
+    const wsUrlA = `ws://127.0.0.1:${srvA.port}/api/v1/ws`;
+    const wsUrlB = `ws://127.0.0.1:${srvB.port}/api/v1/ws`;
+    const wsA = (await openConn(wsUrlA, [`kimi-code.bearer.${paired.token}`])).ws;
+    sockets.push(wsA);
+    const wsB = (await openConn(wsUrlB, [`kimi-code.bearer.${paired.token}`])).ws;
+    sockets.push(wsB);
+
+    const revoke = await fetch(`${base}/api/v1/devices/${paired.deviceId}:revoke`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(revoke.status).toBe(200);
+
+    await waitClose(wsA);
+    await waitClose(wsB);
+
+    await expectRejected(wsUrlB);
+  });
+
+  it('keeps shutdown host-only and lets the server token stop the host', async () => {
+    const paired = await pairDevice();
+    const token = await serverToken();
+
+    const denied = await fetch(`${base}/api/v1/shutdown`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${paired.token}` },
+    });
+    expect(denied.status).toBe(403);
+    expect(((await denied.json()) as { code: number }).code).toBe(40302);
+    expect((await fetch(`${base}/api/v1/healthz`)).status).toBe(200);
+
+    const allowed = await fetch(`${base}/api/v1/shutdown`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(allowed.status).toBe(200);
+    await pollUntil(async () => {
+      try {
+        return (await fetch(`${base}/api/v1/healthz`)).status !== 200;
+      } catch {
+        return true;
+      }
+    }, 5000);
+    server = undefined;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await boot();
   });
 });

@@ -11,6 +11,7 @@ const pairingExchangeRequestSchema = z.object({ code: z.string().min(1) });
 const pairingExchangeResponseSchema = z.object({
   token: z.string(),
   scope: z.literal('device'),
+  device_id: z.string().optional(),
 });
 
 interface PairingRouteHost {
@@ -48,7 +49,12 @@ export function registerPairingRoutes(
         r.code(401).send(errEnvelope(PAIRING_ERROR_CODE, PAIRING_ERROR_MSG, req.id));
         return;
       }
-      r.send(okEnvelope(exchange, req.id));
+      r.send(
+        okEnvelope(
+          { token: exchange.token, scope: exchange.scope, device_id: exchange.deviceId },
+          req.id,
+        ),
+      );
     },
   );
   app.post(

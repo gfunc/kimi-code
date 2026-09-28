@@ -5,6 +5,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,8 +25,13 @@ import {
 import { createTokenStore } from '../src/services/auth/tokenStore';
 import {
   createDeviceTokenStore,
+  deviceTokensPath,
   hashDeviceToken,
 } from '../src/services/auth/deviceTokenStore';
+import {
+  withPrivateFileLock,
+  type PrivateFileLockHooks,
+} from '../src/services/auth/privateFileLock';
 import { createAuthTokenService } from '../src/services/auth/authTokenService';
 import { resolvePasswordHash, verifyPassword } from '../src/services/auth/password';
 
@@ -263,6 +269,266 @@ describe('deviceTokenStore', () => {
     const devices = await createDeviceTokenStore(join(tmpDir, 'home'));
     expect(devices.has('anything')).toBe(false);
     await devices.dispose();
+  });
+});
+
+describe('deviceTokenStore v2', () => {
+  it('migrates a v1 hashes file losslessly to v2 with stable device ids', async () => {
+    const home = join(tmpDir, 'home');
+    const legacyHash = hashDeviceToken('legacy-device-token');
+    await writePrivateFile(
+      deviceTokensPath(home),
+      `${JSON.stringify({ version: 1, hashes: [legacyHash] })}\n`,
+    );
+
+    const store = await createDeviceTokenStore(home);
+    expect(store.has('legacy-device-token')).toBe(true);
+    const listed = store.list();
+    expect(listed).toHaveLength(1);
+    const id = listed[0]!.id;
+    expect(typeof id).toBe('string');
+    expect(id.length).toBeGreaterThan(0);
+    expect(Number.isNaN(new Date(listed[0]!.createdAt).getTime())).toBe(false);
+
+    const raw = JSON.parse(readFileSync(store.path, 'utf8')) as {
+      version: number;
+      devices: Array<{ id: string; hash: string; created_at: string }>;
+    };
+    expect(raw.version).toBe(2);
+    expect(raw.devices).toHaveLength(1);
+    expect(raw.devices[0]!.hash).toBe(legacyHash);
+    expect(raw.devices[0]!.id).toBe(id);
+    expect(raw.devices[0]!.created_at).toBe(listed[0]!.createdAt);
+    await store.dispose();
+
+    const reopened = await createDeviceTokenStore(home);
+    expect(reopened.has('legacy-device-token')).toBe(true);
+    expect(reopened.list()).toEqual([{ id, createdAt: listed[0]!.createdAt }]);
+    expect(await reopened.revokeById(id)).toBe(true);
+    expect(reopened.has('legacy-device-token')).toBe(false);
+    expect(await reopened.revokeById(id)).toBe(false);
+    await reopened.dispose();
+
+    const afterRevoke = await createDeviceTokenStore(home);
+    expect(afterRevoke.has('legacy-device-token')).toBe(false);
+    expect(afterRevoke.list()).toEqual([]);
+    await afterRevoke.dispose();
+  });
+
+  it('adds return unique stable ids and revokeById removes exactly one device', async () => {
+    const home = join(tmpDir, 'home');
+    const store = await createDeviceTokenStore(home);
+    const idA = await store.add('token-a');
+    const idB = await store.add('token-b');
+    expect(idA).not.toBe(idB);
+    expect(await store.add('token-a')).toBe(idA);
+
+    expect(store.find('token-a')?.id).toBe(idA);
+    expect(store.find('token-b')?.id).toBe(idB);
+    expect(store.find('unknown-token')).toBeUndefined();
+    expect(store.list().map((entry) => entry.id).toSorted()).toEqual([idA, idB].toSorted());
+
+    expect(await store.revokeById(idB)).toBe(true);
+    expect(store.has('token-b')).toBe(false);
+    expect(store.has('token-a')).toBe(true);
+    expect(await store.revokeById(idB)).toBe(false);
+    await store.dispose();
+  });
+
+  it('never exposes hashes through list or find', async () => {
+    const home = join(tmpDir, 'home');
+    const store = await createDeviceTokenStore(home);
+    await store.add('hashless-token');
+    const serialized = JSON.stringify({ list: store.list(), find: store.find('hashless-token') });
+    expect(serialized).not.toContain('hash');
+    expect(serialized).not.toContain(hashDeviceToken('hashless-token'));
+    await store.dispose();
+  });
+
+  it('sees another instance writes and revocations on a shared home without re-creating', async () => {
+    const home = join(tmpDir, 'home');
+    const a = await createDeviceTokenStore(home);
+    const b = await createDeviceTokenStore(home);
+
+    await a.add('late-arrival');
+    expect(b.has('late-arrival')).toBe(true);
+    expect(await b.revoke('late-arrival')).toBe(true);
+    expect(a.has('late-arrival')).toBe(false);
+    expect(await b.revoke('late-arrival')).toBe(false);
+    await a.dispose();
+    await b.dispose();
+
+    const fresh = await createDeviceTokenStore(home);
+    expect(fresh.has('late-arrival')).toBe(false);
+    await fresh.dispose();
+  });
+
+  it('keeps concurrent adds from two instances on one shared home', async () => {
+    const home = join(tmpDir, 'home');
+    const a = await createDeviceTokenStore(home);
+    const b = await createDeviceTokenStore(home);
+
+    await Promise.all([a.add('from-a'), b.add('from-b')]);
+    await a.dispose();
+    await b.dispose();
+
+    const fresh = await createDeviceTokenStore(home);
+    expect(fresh.has('from-a')).toBe(true);
+    expect(fresh.has('from-b')).toBe(true);
+    expect(fresh.list()).toHaveLength(2);
+    expect(new Set(fresh.list().map((entry) => entry.id)).size).toBe(2);
+    await fresh.dispose();
+  });
+
+  it('applies a cross-instance revocation after a concurrent add on a shared home', async () => {
+    const home = join(tmpDir, 'home');
+    const a = await createDeviceTokenStore(home);
+    const b = await createDeviceTokenStore(home);
+
+    await a.add('doomed');
+    const [revoked, addedId] = await Promise.all([b.revoke('doomed'), a.add('survivor')]);
+    expect(revoked).toBe(true);
+    expect(typeof addedId).toBe('string');
+
+    await a.dispose();
+    await b.dispose();
+    const fresh = await createDeviceTokenStore(home);
+    expect(fresh.has('doomed')).toBe(false);
+    expect(fresh.has('survivor')).toBe(true);
+    await fresh.dispose();
+  });
+
+  it('takes over a lock left behind by a dead process and keeps mutating', async () => {
+    const home = join(tmpDir, 'home');
+    const store = await createDeviceTokenStore(home);
+    await store.add('before-crash');
+
+    const staleLock = join(home, 'server', 'auth', 'device-tokens.json.lock');
+    await writePrivateFile(staleLock, `${JSON.stringify({ pid: 999999999, nonce: 'ghost' })}\n`);
+
+    const id = await store.add('after-crash');
+    expect(typeof id).toBe('string');
+    expect(store.has('before-crash')).toBe(true);
+    expect(store.has('after-crash')).toBe(true);
+    await store.dispose();
+
+    const fresh = await createDeviceTokenStore(home);
+    expect(fresh.list()).toHaveLength(2);
+    await fresh.dispose();
+  });
+
+  it('re-verifies staleness after a controlled stall and never double-holds the lock', async () => {
+    const home = join(tmpDir, 'home');
+    const store = await createDeviceTokenStore(home);
+    await store.add('seed');
+    await store.dispose();
+    const dataPath = deviceTokensPath(home);
+    const lockPath = `${dataPath}.lock`;
+    await writePrivateFile(lockPath, `${JSON.stringify({ pid: 999999999, nonce: 'ghost' })}\n`);
+
+    let overlap = 0;
+    let maxOverlap = 0;
+    let hookInvoked = false;
+    const order: string[] = [];
+    let resolveGate: (() => void) | undefined;
+    const gateOpened = new Promise<void>((resolve) => {
+      resolveGate = resolve;
+    });
+
+    async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error('wait timed out');
+    }
+
+    function lockNonce(): string {
+      try {
+        return (JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce?: string }).nonce ?? '';
+      } catch {
+        return '';
+      }
+    }
+
+    const holderBody = async (): Promise<void> => {
+      overlap += 1;
+      maxOverlap = Math.max(maxOverlap, overlap);
+      try {
+        order.push('holder-enter');
+        await Promise.race([gateOpened, new Promise((resolve) => setTimeout(resolve, 2000))]);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        order.push('holder-exit');
+      } finally {
+        overlap -= 1;
+      }
+    };
+
+    const hooks: PrivateFileLockHooks = {
+      beforeStaleTakeoverRename: async () => {
+        hookInvoked = true;
+        await waitFor(() => lockNonce() !== '' && lockNonce() !== 'ghost', 2000);
+        resolveGate?.();
+      },
+    };
+
+    const holder = withPrivateFileLock(dataPath, holderBody);
+    const lateContender = withPrivateFileLock(
+      dataPath,
+      async () => {
+        overlap += 1;
+        maxOverlap = Math.max(maxOverlap, overlap);
+        try {
+          order.push('late-enter');
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } finally {
+          overlap -= 1;
+        }
+      },
+      hooks,
+    );
+
+    await Promise.all([holder, lateContender]);
+
+    expect(hookInvoked).toBe(true);
+    expect(order[0]).toBe('holder-enter');
+    expect(order).toContain('late-enter');
+    expect(maxOverlap).toBe(1);
+  });
+
+  it('refuses to mutate and never rewrites when the store file is too permissive', async () => {
+    const home = join(tmpDir, 'home');
+    const store = await createDeviceTokenStore(home);
+    await store.add('keeper');
+    chmodSync(store.path, 0o644);
+    const before = readFileSync(store.path, 'utf8');
+
+    await expect(store.add('intruder')).rejects.toThrowError(PrivateFileTooPermissiveError);
+    expect(readFileSync(store.path, 'utf8')).toBe(before);
+    expect(store.has('intruder')).toBe(false);
+
+    chmodSync(store.path, 0o600);
+    expect(store.has('keeper')).toBe(true);
+    await store.dispose();
+  });
+
+  it('dispose waits for a mutation queued behind an externally held lock', async () => {
+    const home = join(tmpDir, 'home');
+    const store = await createDeviceTokenStore(home);
+    const lockPath = `${deviceTokensPath(home)}.lock`;
+    await writePrivateFile(lockPath, `${JSON.stringify({ pid: process.pid, nonce: 'external' })}\n`);
+
+    const pending = store.add('queued-behind-lock');
+    const done = store.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    unlinkSync(lockPath);
+    await done;
+
+    expect(readFileSync(deviceTokensPath(home), 'utf8')).toContain(
+      hashDeviceToken('queued-behind-lock'),
+    );
+    await pending;
   });
 });
 

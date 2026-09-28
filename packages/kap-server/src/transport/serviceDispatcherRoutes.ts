@@ -1,7 +1,8 @@
-import type { Scope } from '@moonshot-ai/agent-core-v2';
+import { IConfigService, type Scope } from '@moonshot-ai/agent-core-v2';
 
 import { requestLog } from '../lib/requestLog';
 import { reservePromptId, type PromptIdReservation } from '../routes/prompts';
+import { projectConfigValue, toConfigResponse } from '../routes/config';
 import { okEnvelope } from '../protocol/envelope';
 import { ErrorCode } from '../protocol/error-codes';
 import type { ScopeKind } from './channel';
@@ -107,7 +108,7 @@ function makeHandler(
         opts.callTimeoutMs ?? 30_000,
       );
       promptReservation?.submit();
-      return reply.send(okEnvelope(result, requestId));
+      return reply.send(okEnvelope(projectConfigServiceResult(service, method, arg, result), requestId));
     } catch (error) {
       promptReservation?.dispose();
       const envelope = mapError(error, requestId);
@@ -128,4 +129,36 @@ function parseArgFromQuery(query: unknown): unknown {
   if (raw === undefined) return undefined;
   if (typeof raw !== 'string') return undefined;
   return JSON.parse(raw) as unknown;
+}
+
+function projectConfigServiceResult(
+  service: string,
+  method: string,
+  arg: unknown,
+  result: unknown,
+): unknown {
+  if (service !== String(IConfigService)) return result;
+  if (method === 'getAll') {
+    return isPlainObject(result) ? toConfigResponse(result) : result;
+  }
+  if (method !== 'get' && method !== 'inspect') return result;
+  const domain = configDomainOf(arg);
+  if (domain === undefined) return result;
+  if (method === 'get') return projectConfigValue(domain, result);
+  if (!isPlainObject(result)) return result;
+  const projected: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(result)) {
+    projected[key] = projectConfigValue(domain, value);
+  }
+  return projected;
+}
+
+function configDomainOf(arg: unknown): string | undefined {
+  if (typeof arg === 'string') return arg;
+  if (Array.isArray(arg) && typeof arg[0] === 'string') return arg[0];
+  return undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

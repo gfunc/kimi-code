@@ -4,17 +4,21 @@
  * These tests don't actually start the server — the foreground runner is
  * injected, so they verify option parsing, the ready banner / one-line ready
  * output, browser opening, and the rotate-token / deprecated `kimi server kill`
- * subcommands against fake deps. The SIGUSR2 reprint-hook tests are the one
- * exception: they run the real in-process runner against a mocked kap-server
- * so the process-level signal registration itself is under test.
+ * subcommands against fake deps. The reprint tests are the exception: they run
+ * the real in-process runner against a mocked kap-server so the process-level
+ * plumbing itself is under test — SIGUSR2 on POSIX and the raw-mode R / Ctrl+C
+ * key listener on a win32 TTY. The stale pairing-PNG sweep tests hit the real
+ * filesystem under a temp `KIMI_CODE_HOME`.
  */
 
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -30,7 +34,11 @@ import { resetCapabilitiesCache, setCapabilities } from '@moonshot-ai/pi-tui';
 
 import { registerWebCommand } from '#/cli/sub/web';
 import type { LegacyKillDeps } from '#/cli/sub/web/legacy-kill';
-import type { StartForegroundHooks, WebCommandDeps } from '#/cli/sub/web/run';
+import type {
+  InteractiveReprintIo,
+  StartForegroundHooks,
+  WebCommandDeps,
+} from '#/cli/sub/web/run';
 import type { ParsedServerOptions } from '#/cli/sub/web/shared';
 import { darkColors } from '#/tui/theme/colors';
 
@@ -89,6 +97,56 @@ function makeIo(): {
       },
     },
     readStdout: () => out,
+  };
+}
+
+/** Fake TTY stdin matching exactly the surface `startInteractiveReprint` uses. */
+function makeFakeStdin(
+  isTTY: boolean,
+  options: { throwOnUnraw?: boolean; throwOnResume?: boolean } = {},
+): {
+  stdin: InteractiveReprintIo['stdin'];
+  raw: boolean[];
+  listeners: Array<(chunk: string | Buffer) => void>;
+  emit(chunk: string | Buffer): void;
+} {
+  const raw: boolean[] = [];
+  const listeners: Array<(chunk: string | Buffer) => void> = [];
+  const stdin: InteractiveReprintIo['stdin'] = {
+    isTTY,
+    setRawMode: (mode: boolean) => {
+      raw.push(mode);
+      // Simulates an exotic console refusing the mode flip (K3: the restore
+      // path must never be able to block or crash shutdown).
+      if (options.throwOnUnraw === true && mode === false) {
+        throw new Error('setRawMode(false) failed');
+      }
+      return stdin;
+    },
+    resume: () => {
+      if (options.throwOnResume === true) {
+        throw new Error('resume failed');
+      }
+      return stdin;
+    },
+    pause: () => stdin,
+    on: (event: string, listener: (chunk: string | Buffer) => void) => {
+      if (event === 'data') listeners.push(listener);
+      return stdin;
+    },
+    removeListener: (event: string, listener: (chunk: string | Buffer) => void) => {
+      const index = listeners.indexOf(listener);
+      if (event === 'data' && index >= 0) listeners.splice(index, 1);
+      return stdin;
+    },
+  };
+  return {
+    stdin,
+    raw,
+    listeners,
+    emit: (chunk) => {
+      for (const listener of [...listeners]) listener(chunk);
+    },
   };
 }
 
@@ -523,6 +581,8 @@ describe('LAN pairing QR in the ready banner', () => {
       await QRCode.toBuffer('kimi://pair?host=192.168.1.5&port=58627&code=code-pair&alias=devbox'),
     );
     expect(plain).toContain('Reprint:');
+    // POSIX keeps the SIGUSR2 hint (works with or without a terminal).
+    expect(plain).toMatch(/kill -USR2 \d+/);
   });
 
   it('prints no pairing QR when auth is bypassed', async () => {
@@ -574,7 +634,7 @@ describe('LAN pairing QR in the ready banner', () => {
   });
 });
 
-describe('SIGUSR2 reprint hook is POSIX-only', () => {
+describe('server reprint plumbing (SIGUSR2 on POSIX, keys on win32 TTY)', () => {
   const REAL_SERVER_OPTIONS: ParsedServerOptions = {
     host: '127.0.0.1',
     port: 58627,
@@ -636,9 +696,10 @@ describe('SIGUSR2 reprint hook is POSIX-only', () => {
       onSpy,
       onceSpy,
       // Remove exactly what these tests registered; leave vitest infra alone.
+      // 'exit' covers the terminal-restore exit hook the runner registers.
       cleanup: () => {
         for (const [signal, listener] of [...onSpy.mock.calls, ...onceSpy.mock.calls]) {
-          if (LIFECYCLE_SIGNALS.has(String(signal))) {
+          if (LIFECYCLE_SIGNALS.has(String(signal)) || signal === 'exit') {
             process.off(signal as NodeJS.Signals, listener as never);
           }
         }
@@ -652,21 +713,29 @@ describe('SIGUSR2 reprint hook is POSIX-only', () => {
    * Drive the real in-process foreground runner (against the mocked
    * kap-server) until `onReady` fires. The runner never settles after that,
    * so each test must call `cleanup()` to unregister the lifecycle listeners.
+   * `io` injects fake streams for the win32 interactive key listener.
    */
-  async function runForegroundUntilReady(hooks: StartForegroundHooks = {}): Promise<void> {
+  async function runForegroundUntilReady(
+    hooks: StartForegroundHooks = {},
+    io?: InteractiveReprintIo,
+  ): Promise<void> {
     mockServerSeams();
     const { startServerForeground } = await import('#/cli/sub/web/run');
     let resolveReady!: () => void;
     const ready = new Promise<void>((resolve) => {
       resolveReady = resolve;
     });
-    const blocking = startServerForeground(REAL_SERVER_OPTIONS, {
-      ...hooks,
-      onReady: async (origin, createPairingCode) => {
-        await hooks.onReady?.(origin, createPairingCode);
-        resolveReady();
+    const blocking = startServerForeground(
+      REAL_SERVER_OPTIONS,
+      {
+        ...hooks,
+        onReady: async (origin, createPairingCode) => {
+          await hooks.onReady?.(origin, createPairingCode);
+          resolveReady();
+        },
       },
-    });
+      io,
+    );
     void blocking.catch(() => {});
     await ready;
   }
@@ -677,39 +746,103 @@ describe('SIGUSR2 reprint hook is POSIX-only', () => {
     return home;
   }
 
-  it('drops reprint eligibility on win32: the runner gets no onReprint and the banner has no Reprint hint', async () => {
+  it('prints the press-R reprint hint in the win32 banner on an interactive TTY', async () => {
     const { handleWebCommand } = await import('#/cli/sub/web/run');
     const home = stubTmpHome('kimi-web-win-elig-');
     setCapabilities({ images: null, trueColor: true, hyperlinks: false });
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     try {
-      const seen: { hooks?: StartForegroundHooks } = {};
-      const runner: ForegroundRunner = async (_options, hooks) => {
+      const seen: { hooks?: StartForegroundHooks; io?: InteractiveReprintIo } = {};
+      const runner: ForegroundRunner = async (_options, hooks, io) => {
         seen.hooks = hooks;
+        seen.io = io;
         await hooks?.onReady?.('http://0.0.0.0:58627', () => 'code-pair');
         return undefined as never;
       };
-      const { stdout, stderr, readStdout } = makeIo();
+      const io = makeIo();
+      const interactiveIo: InteractiveReprintIo = {
+        stdin: makeFakeStdin(true).stdin,
+        stdout: { isTTY: true },
+      };
 
       await handleWebCommand(
         { host: '0.0.0.0', open: false },
         {
           startServerForeground: runner,
           resolveToken: () => 'tok-win',
+          interactiveIo,
           networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
           hostname: () => 'devbox',
           openUrl: vi.fn(),
-          stdout,
-          stderr,
+          stdout: io.stdout,
+          stderr: io.stderr,
         },
       );
 
-      expect(seen.hooks?.onReprint).toBeUndefined();
+      // The hook reaches the runner on win32 too now; the runner picks the
+      // trigger per platform (SIGUSR2 on POSIX, the key listener on a TTY).
+      expect(seen.hooks?.onReprint).toBeDefined();
       expect(seen.hooks?.onReady).toBeDefined();
-      const plain = stripAnsi(readStdout());
-      // The pairing QR itself still prints; only the SIGUSR2 reprint hint goes.
+      const plain = stripAnsi(io.readStdout());
       expect(plain).toContain('Pairing:');
-      expect(plain).not.toContain('Reprint:');
+      expect(plain).toContain('Reprint:');
+      expect(plain).toContain('press R');
+      expect(plain).not.toContain('kill -USR2');
+      // K3 consistency: the banner judged the exact same streams the runner
+      // was handed — the hint can never promise a key the listener won't hear.
+      expect(seen.io).toBe(interactiveIo);
+    } finally {
+      platformSpy.mockRestore();
+      vi.unstubAllEnvs();
+      resetCapabilitiesCache();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to a restart hint in the win32 banner without a terminal', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const home = stubTmpHome('kimi-web-win-headless-banner-');
+    setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    try {
+      const seen: { hooks?: StartForegroundHooks; io?: InteractiveReprintIo } = {};
+      const runner: ForegroundRunner = async (_options, hooks, io) => {
+        seen.hooks = hooks;
+        seen.io = io;
+        await hooks?.onReady?.('http://0.0.0.0:58627', () => 'code-pair');
+        return undefined as never;
+      };
+      const io = makeIo();
+      const interactiveIo: InteractiveReprintIo = {
+        stdin: makeFakeStdin(false).stdin,
+        stdout: { isTTY: true },
+      };
+
+      await handleWebCommand(
+        { host: '0.0.0.0', open: false },
+        {
+          startServerForeground: runner,
+          resolveToken: () => 'tok-win',
+          interactiveIo,
+          networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+          hostname: () => 'devbox',
+          openUrl: vi.fn(),
+          stdout: io.stdout,
+          stderr: io.stderr,
+        },
+      );
+
+      // The hook is still supplied (the runner ignores it without a TTY); the
+      // banner points at a restart instead of a key or signal.
+      expect(seen.hooks?.onReprint).toBeDefined();
+      const plain = stripAnsi(io.readStdout());
+      expect(plain).toContain('Pairing:');
+      expect(plain).toContain('Reprint:');
+      expect(plain).toContain('restart kimi web');
+      expect(plain).not.toContain('press R');
+      expect(plain).not.toContain('kill -USR2');
+      // Same streams reached the runner, so both sides agree there is no key.
+      expect(seen.io).toBe(interactiveIo);
     } finally {
       platformSpy.mockRestore();
       vi.unstubAllEnvs();
@@ -759,6 +892,495 @@ describe('SIGUSR2 reprint hook is POSIX-only', () => {
       vi.unstubAllEnvs();
       rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  it('starts the key listener on a win32 TTY: R reprints, Ctrl+C shuts down, terminal restored', async () => {
+    const home = stubTmpHome('kimi-web-win-keys-');
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const { onSpy, onceSpy, cleanup } = spySignals();
+    const fake = makeFakeStdin(true);
+    try {
+      const reprint = vi.fn();
+      await runForegroundUntilReady(
+        { onReprint: reprint },
+        { stdin: fake.stdin, stdout: { isTTY: true } },
+      );
+
+      expect(fake.raw).toEqual([true]);
+      expect(fake.listeners.length).toBe(1);
+
+      fake.emit('r');
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(reprint).toHaveBeenCalledTimes(1);
+
+      // Ctrl+C must not be swallowed: it drives the graceful shutdown to the
+      // same process.exit(0) a real SIGINT reaches, and raw mode is undone.
+      fake.emit(Buffer.from([0x03]));
+      for (let i = 0; i < 10 && exitSpy.mock.calls.length === 0; i++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledWith(0);
+      expect(fake.raw).toEqual([true, false]);
+
+      // K3: the first Ctrl+C also detaches the once-armed lifecycle listeners,
+      // so the NEXT Ctrl+C (a real signal, cooked mode restored) hits Node's
+      // default hard termination instead of a no-op guard and needing a third.
+      // SIGINT and SIGTERM are symmetric.
+      const sigintHandler = onceSpy.mock.calls.find(([signal]) => signal === 'SIGINT')?.[1];
+      expect(sigintHandler).toBeDefined();
+      expect(process.listeners('SIGINT')).not.toContain(sigintHandler);
+      const sigtermHandler = onceSpy.mock.calls.find(([signal]) => signal === 'SIGTERM')?.[1];
+      expect(sigtermHandler).toBeDefined();
+      expect(process.listeners('SIGTERM')).not.toContain(sigtermHandler);
+
+      // The listener is gone after the stop: further keys do nothing.
+      fake.emit('r');
+      fake.emit(Buffer.from([0x03]));
+      expect(reprint).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      unmockServerSeams();
+      cleanup();
+      platformSpy.mockRestore();
+      exitSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps shutdown reaching process.exit when restoring raw mode throws (K3 hang)', async () => {
+    const home = stubTmpHome('kimi-web-win-unraw-throw-');
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const { onSpy, onceSpy, cleanup } = spySignals();
+    const fake = makeFakeStdin(true, { throwOnUnraw: true });
+    try {
+      await runForegroundUntilReady(
+        { onReprint: () => {} },
+        { stdin: fake.stdin, stdout: { isTTY: true } },
+      );
+
+      fake.emit(Buffer.from([0x03]));
+      for (let i = 0; i < 10 && exitSpy.mock.calls.length === 0; i++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      // The setRawMode(false) failure is absorbed; shutdown still completes
+      // (stopping must never become a trap with no way out). raw records the
+      // attempted restore — the throw just never escapes.
+      expect(exitSpy).toHaveBeenCalledTimes(1);
+      expect(exitSpy).toHaveBeenCalledWith(0);
+      expect(fake.raw).toEqual([true, false]);
+    } finally {
+      unmockServerSeams();
+      cleanup();
+      platformSpy.mockRestore();
+      exitSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('restores the terminal through the process exit hook on abnormal exit', async () => {
+    const home = stubTmpHome('kimi-web-win-exit-hook-');
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const { onSpy, onceSpy, cleanup } = spySignals();
+    const fake = makeFakeStdin(true);
+    try {
+      await runForegroundUntilReady(
+        { onReprint: () => {} },
+        { stdin: fake.stdin, stdout: { isTTY: true } },
+      );
+      expect(fake.raw).toEqual([true]);
+
+      // Simulate an abnormal exit path that never runs shutdown(): fire the
+      // registered 'exit' hook directly.
+      const exitHook = onSpy.mock.calls.find(([event]) => event === 'exit')?.[1];
+      expect(exitHook).toBeDefined();
+      (exitHook as () => void)();
+      expect(fake.raw).toEqual([true, false]);
+      expect(fake.listeners).toEqual([]);
+
+      // The hook is one-shot: firing it again (post-stop) is inert.
+      (exitHook as () => void)();
+      expect(fake.raw).toEqual([true, false]);
+    } finally {
+      unmockServerSeams();
+      cleanup();
+      platformSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('starts no key listener on win32 when stdin is not a TTY (headless restart-hint case)', async () => {
+    const home = stubTmpHome('kimi-web-win-headless-runner-');
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    const { onSpy, onceSpy, cleanup } = spySignals();
+    const fake = makeFakeStdin(false);
+    try {
+      await runForegroundUntilReady(
+        { onReprint: () => {} },
+        { stdin: fake.stdin, stdout: { isTTY: true } },
+      );
+
+      expect(fake.raw).toEqual([]);
+      expect(fake.listeners).toEqual([]);
+    } finally {
+      unmockServerSeams();
+      cleanup();
+      platformSpy.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('starts no key listener on POSIX even with a TTY (SIGUSR2 stays the only trigger)', async () => {
+    if (process.platform === 'win32') return;
+    const home = stubTmpHome('kimi-web-posix-keys-');
+    const { onSpy, onceSpy, cleanup } = spySignals();
+    const fake = makeFakeStdin(true);
+    try {
+      await runForegroundUntilReady(
+        { onReprint: () => {} },
+        { stdin: fake.stdin, stdout: { isTTY: true } },
+      );
+
+      expect(fake.raw).toEqual([]);
+      expect(fake.listeners).toEqual([]);
+    } finally {
+      unmockServerSeams();
+      cleanup();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('interactive reprint keys', () => {
+  it('requires win32 with a TTY on both stdin and stdout', async () => {
+    const { canInteractiveReprint } = await import('#/cli/sub/web/run');
+    const tty = { isTTY: true };
+    const pipe = { isTTY: false };
+    expect(canInteractiveReprint('win32', tty, { isTTY: true })).toBe(true);
+    // Negative controls: each gate alone must disable the key listener.
+    expect(canInteractiveReprint('linux', tty, { isTTY: true })).toBe(false);
+    expect(canInteractiveReprint('darwin', tty, { isTTY: true })).toBe(false);
+    expect(canInteractiveReprint('win32', pipe, { isTTY: true })).toBe(false);
+    expect(canInteractiveReprint('win32', tty, pipe)).toBe(false);
+    expect(canInteractiveReprint('win32', undefined, undefined)).toBe(false);
+  });
+
+  it('reprints only on an exact lone R, quits on Ctrl+C (never swallowing it), and restores raw mode on stop', async () => {
+    const { startInteractiveReprint } = await import('#/cli/sub/web/run');
+    const fake = makeFakeStdin(true);
+    const reprint = vi.fn();
+    const quit = vi.fn();
+    const stop = startInteractiveReprint(
+      { stdin: fake.stdin, stdout: { isTTY: true } },
+      reprint,
+      quit,
+    );
+
+    expect(fake.raw).toEqual([true]);
+    fake.emit('x'); // unrelated key: ignored
+    fake.emit(Buffer.from('rr')); // K3: a burst (paste) containing r must not reprint
+    fake.emit(Buffer.from('bar'));
+    expect(reprint).not.toHaveBeenCalled();
+    fake.emit('r');
+    fake.emit(Buffer.from('R'));
+    expect(reprint).toHaveBeenCalledTimes(2);
+    expect(quit).not.toHaveBeenCalled();
+
+    fake.emit(Buffer.from('a\u0003b')); // Ctrl+C inside a burst still quits
+    expect(quit).toHaveBeenCalledTimes(1);
+    expect(reprint).toHaveBeenCalledTimes(2);
+
+    stop();
+    stop(); // idempotent
+    expect(fake.raw).toEqual([true, false]);
+    fake.emit('r');
+    fake.emit(Buffer.from([0x03]));
+    expect(reprint).toHaveBeenCalledTimes(2);
+    expect(quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('never throws from stop even when the console refuses unraw', async () => {
+    const { startInteractiveReprint } = await import('#/cli/sub/web/run');
+    const fake = makeFakeStdin(true, { throwOnUnraw: true });
+    const stop = startInteractiveReprint(
+      { stdin: fake.stdin, stdout: { isTTY: true } },
+      () => {},
+      () => {},
+    );
+    expect(() => stop()).not.toThrow();
+    expect(fake.listeners).toEqual([]);
+  });
+
+  it('rolls the terminal fully back when resume fails after raw mode is on', async () => {
+    const { startInteractiveReprint } = await import('#/cli/sub/web/run');
+    const fake = makeFakeStdin(true, { throwOnResume: true });
+    expect(() =>
+      startInteractiveReprint(
+        { stdin: fake.stdin, stdout: { isTTY: true } },
+        () => {},
+        () => {},
+      ),
+    ).toThrow('resume failed');
+    // K3: raw mode is undone and the listener is gone — the failed start must
+    // not leave a raw terminal swallowing Ctrl+C with no quit handler.
+    expect(fake.raw).toEqual([true, false]);
+    expect(fake.listeners).toEqual([]);
+  });
+});
+
+describe('stale pairing PNG sweep', () => {
+  let home: string;
+
+  const pngPath = (): string => join(home, 'pairing-qrcode.png');
+
+  function seedPng(ageMs?: number): void {
+    writeFileSync(pngPath(), 'png');
+    if (ageMs !== undefined) {
+      const stamp = new Date(Date.now() - ageMs);
+      utimesSync(pngPath(), stamp, stamp);
+    }
+  }
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'kimi-pair-sweep-'));
+    vi.stubEnv('KIMI_CODE_HOME', home);
+    setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetCapabilitiesCache();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('sweeps a stale pairing PNG at startup and keeps a fresh one (loopback run)', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { runner } = makeRunner('http://127.0.0.1:58627');
+    const { stdout, stderr } = makeIo();
+
+    seedPng(10 * 60_000);
+    await handleWebCommand(
+      { host: '127.0.0.1', open: false },
+      { startServerForeground: runner, openUrl: vi.fn(), stdout, stderr },
+    );
+    expect(existsSync(pngPath())).toBe(false);
+
+    // Negative control: a fresh PNG (inside the pairing-code window) survives,
+    // so a concurrently pairing instance's QR is never swept.
+    seedPng();
+    await handleWebCommand(
+      { host: '127.0.0.1', open: false },
+      { startServerForeground: runner, openUrl: vi.fn(), stdout, stderr },
+    );
+    expect(existsSync(pngPath())).toBe(true);
+    expect(readFileSync(pngPath(), 'utf8')).toBe('png');
+  });
+
+  it('a short pairing session removes its own PNG on graceful shutdown (no fresh residue)', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { stdout, stderr } = makeIo();
+    const runner: ForegroundRunner = async (_options, hooks) => {
+      await hooks?.onReady?.('http://0.0.0.0:58627', () => 'code-pair');
+      // K3: a Ctrl+C right after pairing must not leave the still-fresh PNG
+      // behind until some age threshold — the writer takes it back.
+      await hooks?.onShutdown?.('SIGINT');
+      return undefined as never;
+    };
+
+    await handleWebCommand(
+      { host: '0.0.0.0', open: false },
+      {
+        startServerForeground: runner,
+        networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+        hostname: () => 'devbox',
+        openUrl: vi.fn(),
+        stdout,
+        stderr,
+      },
+    );
+    expect(existsSync(pngPath())).toBe(false);
+  });
+
+  it('shutdown keeps a foreign pairing PNG this run did not write (loopback run)', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { stdout, stderr } = makeIo();
+    const runner: ForegroundRunner = async (_options, hooks) => {
+      await hooks?.onReady?.('http://127.0.0.1:58627', () => 'code-pair');
+      await hooks?.onShutdown?.('SIGINT');
+      return undefined as never;
+    };
+
+    // Negative control: a PNG this run never wrote (fresh, so the startup age
+    // sweep must also keep it) survives a loopback run's whole lifecycle.
+    seedPng();
+    await handleWebCommand(
+      { host: '127.0.0.1', open: false },
+      { startServerForeground: runner, openUrl: vi.fn(), stdout, stderr },
+    );
+    expect(existsSync(pngPath())).toBe(true);
+    expect(readFileSync(pngPath(), 'utf8')).toBe('png');
+  });
+
+  it('shutdown keeps the PNG when another instance overwrote it after our banner', async () => {
+    const { handleWebCommand } = await import('#/cli/sub/web/run');
+    const { stdout, stderr } = makeIo();
+    const runner: ForegroundRunner = async (_options, hooks) => {
+      await hooks?.onReady?.('http://0.0.0.0:58627', () => 'code-pair');
+      // A concurrently pairing instance rewrites the fixed path between our
+      // banner and our shutdown: the file is theirs now, not ours to remove.
+      writeFileSync(pngPath(), 'another-instance');
+      await hooks?.onShutdown?.('SIGINT');
+      return undefined as never;
+    };
+
+    await handleWebCommand(
+      { host: '0.0.0.0', open: false },
+      {
+        startServerForeground: runner,
+        networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+        hostname: () => 'devbox',
+        openUrl: vi.fn(),
+        stdout,
+        stderr,
+      },
+    );
+    expect(existsSync(pngPath())).toBe(true);
+    expect(readFileSync(pngPath(), 'utf8')).toBe('another-instance');
+  });
+});
+
+describe('removeStalePairingQrPng', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'kimi-pair-sweep-unit-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function ageFile(path: string, ageMs: number): void {
+    const stamp = new Date(Date.now() - ageMs);
+    utimesSync(path, stamp, stamp);
+  }
+
+  it('removes only the fixed pairing PNG, never the shared remote-control QR or siblings', async () => {
+    const { removeStalePairingQrPng } = await import('#/cli/sub/web/pairing');
+    const png = join(dir, 'pairing-qrcode.png');
+    writeFileSync(png, 'dead');
+    ageFile(png, 10 * 60_000);
+    const rc = join(dir, 'rc-qrcode.png');
+    writeFileSync(rc, 'shared-rc');
+    ageFile(rc, 10 * 60_000);
+    writeFileSync(join(dir, 'unrelated.txt'), 'keep');
+
+    await expect(removeStalePairingQrPng({ dataDir: dir })).resolves.toBe(true);
+
+    expect(existsSync(png)).toBe(false);
+    expect(existsSync(rc)).toBe(true);
+    expect(readFileSync(rc, 'utf8')).toBe('shared-rc');
+    expect(existsSync(join(dir, 'unrelated.txt'))).toBe(true);
+  });
+
+  it('keeps the PNG up to the threshold and removes it only past it', async () => {
+    const { removeStalePairingQrPng } = await import('#/cli/sub/web/pairing');
+    const png = join(dir, 'pairing-qrcode.png');
+    writeFileSync(png, 'png');
+    ageFile(png, 90_000);
+    await expect(removeStalePairingQrPng({ dataDir: dir })).resolves.toBe(false);
+    expect(existsSync(png)).toBe(true);
+    // Injected clock exactly at the threshold: still kept (age <= maxAge).
+    const mtimeMs = statSync(png).mtimeMs;
+    await expect(
+      removeStalePairingQrPng({ dataDir: dir, now: mtimeMs + 120_000 }),
+    ).resolves.toBe(false);
+    // One tick past it: removed.
+    await expect(
+      removeStalePairingQrPng({ dataDir: dir, now: mtimeMs + 120_000 + 1 }),
+    ).resolves.toBe(true);
+    expect(existsSync(png)).toBe(false);
+  });
+
+  it('treats a missing file or a directory at the path as nothing to sweep', async () => {
+    const { removeStalePairingQrPng } = await import('#/cli/sub/web/pairing');
+    await expect(removeStalePairingQrPng({ dataDir: dir })).resolves.toBe(false);
+    mkdirSync(join(dir, 'pairing-qrcode.png'));
+    await expect(removeStalePairingQrPng({ dataDir: dir })).resolves.toBe(false);
+    expect(statSync(join(dir, 'pairing-qrcode.png')).isDirectory()).toBe(true);
+  });
+});
+
+describe('pairing PNG ownership cleanup', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'kimi-pair-owned-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const pngPath = (): string => join(dir, 'pairing-qrcode.png');
+
+  it('snapshots the identity of the current PNG, undefined when missing or a directory', async () => {
+    const { statPairingPng } = await import('#/cli/sub/web/pairing');
+    await expect(statPairingPng(dir)).resolves.toBeUndefined();
+    writeFileSync(pngPath(), 'png-bytes');
+    const identity = await statPairingPng(dir);
+    expect(identity).toEqual({
+      mtimeMs: statSync(pngPath()).mtimeMs,
+      size: statSync(pngPath()).size,
+    });
+    rmSync(pngPath());
+    mkdirSync(pngPath());
+    await expect(statPairingPng(dir)).resolves.toBeUndefined();
+  });
+
+  it('removes the file only while it still carries the owned identity', async () => {
+    const { removeOwnedPairingQrPng, statPairingPng } = await import('#/cli/sub/web/pairing');
+    writeFileSync(pngPath(), 'png-bytes');
+    const identity = await statPairingPng(dir);
+    await expect(removeOwnedPairingQrPng({ dataDir: dir, owned: identity })).resolves.toBe(
+      true,
+    );
+    expect(existsSync(pngPath())).toBe(false);
+  });
+
+  it('keeps the file when its size or mtime no longer matches (overwritten elsewhere)', async () => {
+    const { removeOwnedPairingQrPng, statPairingPng } = await import('#/cli/sub/web/pairing');
+    writeFileSync(pngPath(), 'png-bytes');
+    const identity = await statPairingPng(dir);
+
+    // Different writer, same size: mtime alone must still disown it.
+    writeFileSync(pngPath(), 'xxx-bytes');
+    await expect(removeOwnedPairingQrPng({ dataDir: dir, owned: identity })).resolves.toBe(
+      false,
+    );
+    expect(readFileSync(pngPath(), 'utf8')).toBe('xxx-bytes');
+
+    // Same bytes, later mtime (another instance rewrote the same payload).
+    writeFileSync(pngPath(), 'png-bytes');
+    const later = new Date(Date.now() + 5_000);
+    utimesSync(pngPath(), later, later);
+    await expect(removeOwnedPairingQrPng({ dataDir: dir, owned: identity })).resolves.toBe(
+      false,
+    );
+    expect(existsSync(pngPath())).toBe(true);
+  });
+
+  it('is a no-op without an owned identity, with a missing file, or on stat errors', async () => {
+    const { removeOwnedPairingQrPng, statPairingPng } = await import('#/cli/sub/web/pairing');
+    await expect(removeOwnedPairingQrPng({ dataDir: dir })).resolves.toBe(false);
+    const identity = await statPairingPng(dir);
+    await expect(removeOwnedPairingQrPng({ dataDir: dir, owned: identity })).resolves.toBe(
+      false,
+    );
+    expect(existsSync(pngPath())).toBe(false);
   });
 });
 
@@ -1053,24 +1675,38 @@ describe('`kimi web` option threading', () => {
 
   it('prints the one-line ready line instead of the full banner with a non-default --log-level', async () => {
     const { handleWebCommand } = await import('#/cli/sub/web/run');
-    const { runner } = makeRunner();
+    // A wildcard bind with a usable LAN address would pair on the full banner;
+    // the compact line must not even generate (and write) the QR/PNG.
+    const { runner } = makeRunner('http://0.0.0.0:58627');
     const { stdout, stderr, readStdout } = makeIo();
+    const home = mkdtempSync(join(tmpdir(), 'kimi-web-logline-'));
+    vi.stubEnv('KIMI_CODE_HOME', home);
+    try {
+      await handleWebCommand(
+        { port: '58627', host: '0.0.0.0', logLevel: 'info', open: false },
+        {
+          startServerForeground: runner,
+          resolveToken: () => 'tok',
+          networkAddresses: [{ address: '192.168.1.5', family: 'IPv4' }],
+          hostname: () => 'devbox',
+          openUrl: vi.fn(),
+          stdout,
+          stderr,
+        },
+      );
 
-    await handleWebCommand(
-      { port: '58627', logLevel: 'info', open: false },
-      {
-        startServerForeground: runner,
-        resolveToken: () => 'tok',
-        openUrl: vi.fn(),
-        stdout,
-        stderr,
-      },
-    );
-
-    const plain = stripAnsi(readStdout());
-    expect(plain).toContain('Kimi server: http://127.0.0.1:58627/#token=tok');
-    expect(plain).not.toContain('Kimi server ready');
-    expect(plain).not.toContain('Local:');
+      const plain = stripAnsi(readStdout());
+      expect(plain).toContain('Kimi server: http://0.0.0.0:58627/#token=tok');
+      expect(plain).not.toContain('Kimi server ready');
+      expect(plain).not.toContain('Local:');
+      expect(plain).not.toContain('Pairing:');
+      // K3: a compact run must not mint a single-use pairing code into a PNG
+      // it never displays.
+      expect(existsSync(join(home, 'pairing-qrcode.png'))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('parses comma-separated --allowed-host values', async () => {

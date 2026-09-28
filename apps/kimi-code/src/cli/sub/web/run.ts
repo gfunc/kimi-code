@@ -39,7 +39,15 @@ import {
   splitTokenFragment,
 } from './access-urls';
 import { listNetworkAddresses, type NetworkAddress } from './networks';
-import { buildPairingUri, pairingLanHost, PAIRING_QR_PNG_FILE } from './pairing';
+import {
+  buildPairingUri,
+  pairingLanHost,
+  PAIRING_QR_PNG_FILE,
+  removeOwnedPairingQrPng,
+  removeStalePairingQrPng,
+  statPairingPng,
+  type PairingPngIdentity,
+} from './pairing';
 import {
   formatRemoteControlOutput,
   formatRemoteControlStatus,
@@ -82,9 +90,115 @@ export interface WebCliOptions extends ServerCliOptions {
 export interface StartForegroundHooks {
   /** Fires once the server is listening, before the foreground runner blocks. */
   onReady?: (origin: string, createPairingCode: () => string) => void | Promise<void>;
-  /** Fires on SIGUSR2 so the caller can reprint the ready banner (a fresh pairing QR). POSIX only — never registered on Windows (no SIGUSR2). */
+  /**
+   * Fires when the user asks for a reprint of the ready banner (a fresh
+   * pairing QR). The runner registers the platform-appropriate trigger: the
+   * SIGUSR2 signal on POSIX, the raw-mode `R` key on a Windows foreground
+   * TTY. Never registered when the full banner is not shown.
+   */
   onReprint?: () => void | Promise<void>;
   onShutdown?: (reason: string) => void | Promise<void>;
+}
+
+/** Keys the interactive reprint listener reacts to. */
+const REPRINT_KEY_CTRL_C = 0x03;
+const REPRINT_KEY_R_LOWER = 0x72;
+const REPRINT_KEY_R_UPPER = 0x52;
+
+/**
+ * The streams the interactive reprint listener runs against; injectable so
+ * tests can drive it without a real terminal.
+ */
+export interface InteractiveReprintIo {
+  stdin: {
+    isTTY?: boolean;
+    setRawMode(mode: boolean): unknown;
+    resume(): unknown;
+    pause(): unknown;
+    on(event: string, listener: (chunk: string | Buffer) => void): unknown;
+    removeListener(event: string, listener: (chunk: string | Buffer) => void): unknown;
+  };
+  stdout: { isTTY?: boolean };
+}
+
+/**
+ * Whether the interactive reprint key listener can run: Windows only (POSIX
+ * reprints via SIGUSR2, which Windows lacks) and only with a real interactive
+ * terminal on both ends — stdin to receive the keypress, stdout so the user
+ * can actually see the banner being reprinted.
+ */
+export function canInteractiveReprint(
+  platform: NodeJS.Platform,
+  stdin: { isTTY?: boolean } | undefined,
+  stdout: { isTTY?: boolean } | undefined,
+): boolean {
+  return platform === 'win32' && stdin?.isTTY === true && stdout?.isTTY === true;
+}
+
+/**
+ * Windows-safe reprint trigger for the foreground pairing banner: raw-mode
+ * stdin watches for `R` (reprint) and Ctrl+C (quit). Raw mode necessarily
+ * hides Ctrl+C from the terminal driver on every platform, so the listener
+ * forwards `\x03` to `onQuit` — the graceful SIGINT shutdown — instead of
+ * swallowing it. The returned stop function removes the listener and restores
+ * cooked mode immediately, so any later Ctrl+C flows natively again; it is
+ * idempotent and absorbs console errors, so a broken terminal can never block
+ * or crash the shutdown that calls it.
+ */
+export function startInteractiveReprint(
+  io: InteractiveReprintIo,
+  onReprint: () => void,
+  onQuit: () => void,
+): () => void {
+  const stdin = io.stdin;
+  const onKey = (chunk: string | Buffer): void => {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+    if (bytes.includes(REPRINT_KEY_CTRL_C)) {
+      onQuit();
+      return;
+    }
+    // Reprint only on an exact lone R keystroke — a pasted burst that happens
+    // to contain an `r` must not repaint the banner.
+    if (
+      bytes.length === 1 &&
+      (bytes[0] === REPRINT_KEY_R_LOWER || bytes[0] === REPRINT_KEY_R_UPPER)
+    ) {
+      onReprint();
+    }
+  };
+  // Setup failures roll everything back: a half-started listener must never
+  // survive with raw mode on, swallowing Ctrl+C with no quit handler.
+  stdin.on('data', onKey);
+  try {
+    stdin.setRawMode(true);
+    stdin.resume();
+  } catch (error) {
+    // Un-raw first so a Ctrl+C during the rollback stays native, then remove
+    // the listener; the rollback itself is best-effort.
+    try {
+      stdin.setRawMode(false);
+    } catch {
+      // Console is broken; the rethrow below still surfaces the cause.
+    }
+    stdin.removeListener('data', onKey);
+    throw error;
+  }
+  let stopped = false;
+  // Best-effort: a wedged console must never break the stop path (K3).
+  const tryRun = (op: () => unknown): void => {
+    try {
+      op();
+    } catch {
+      // Console already gone; nothing left to restore.
+    }
+  };
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    tryRun(() => stdin.removeListener('data', onKey));
+    tryRun(() => stdin.setRawMode(false));
+    tryRun(() => stdin.pause());
+  };
 }
 
 export interface WebCommandDeps {
@@ -92,6 +206,7 @@ export interface WebCommandDeps {
   startServerForeground?: (
     options: ParsedServerOptions,
     hooks?: StartForegroundHooks,
+    io?: InteractiveReprintIo,
   ) => Promise<never>;
   startRemoteControl?: (options: RemoteControlOptions) => Promise<RemoteControlHandle>;
   openUrl(url: string): void;
@@ -113,6 +228,13 @@ export interface WebCommandDeps {
    * `os.hostname()`; inject a fixed one in tests for deterministic output.
    */
   hostname?: () => string;
+  /**
+   * Terminal streams used for the win32 interactive reprint: both the
+   * banner's Reprint-hint decision and the foreground runner's key listener
+   * judge this exact object, so the hint can never promise a key the listener
+   * would not hear. Defaults to the process's own terminal streams.
+   */
+  interactiveIo?: InteractiveReprintIo;
   stdout: Pick<NodeJS.WriteStream, 'write'>;
   stderr: Pick<NodeJS.WriteStream, 'write'>;
 }
@@ -211,97 +333,144 @@ export async function handleWebCommand(
   }
   const run = deps.startServerForeground ?? startServerForeground;
   let remoteControl: RemoteControlHandle | undefined;
-  // Only the full ready banner carries the pairing QR; a reprint signal for
+  // The banner's Reprint hint and the runner's key listener must judge the
+  // same terminal, so one io object feeds both.
+  const io: InteractiveReprintIo = deps.interactiveIo ?? {
+    stdin: process.stdin,
+    stdout: process.stdout,
+  };
+  // Only the full ready banner carries the pairing QR; a reprint trigger for
   // the compact line (or an auth-bypass run, which never pairs) is pointless.
-  // Reprinting rides on SIGUSR2, which does not exist on Windows (Node throws
-  // ERR_UNKNOWN_SIGNAL when registering one), so it is POSIX-only.
+  // The runner picks the trigger per platform: SIGUSR2 on POSIX, the raw-mode
+  // `R` key on a Windows foreground TTY, nothing on Windows without a
+  // terminal (the banner then points at a restart instead).
   const canReprint =
-    process.platform !== 'win32' &&
     opts.remoteControl !== true &&
     !parsed.dangerousBypassAuth &&
     parsed.logLevel === DEFAULT_FOREGROUND_LOG_LEVEL;
+  // Sweep a pairing QR PNG left on the fixed path by an earlier run that died
+  // without cleanup (loopback / remote-control / restarted / crashed /
+  // expired). Age-gated: a file still inside the pairing-code window is never
+  // removed, so a concurrently running pairing instance keeps its freshly
+  // written QR. A pairing run regenerates the file moments later either way.
+  await removeStalePairingQrPng({ dataDir: getDataDir() });
   let printReady: (() => Promise<void>) | undefined;
-  await run(parsed, {
-    onReady: async (origin, createPairingCode) => {
-      // Resolve the persistent token only once the server is up: a fresh
-      // server writes `server.token` on first boot, so reading it beforehand
-      // would miss first-time starts and the browser would hit the auth gate.
-      // It is printed in the ready banner and rides in the opened Web UI
-      // URL's `#token=` fragment (M5.5); falls back to the plain origin / no
-      // token line when unavailable. When auth is bypassed, the token is
-      // meaningless and is intentionally NOT shown or carried in the URL.
-      const token = parsed.dangerousBypassAuth ? undefined : deps.resolveToken?.();
-      if (opts.remoteControl === true) {
-        if (token === undefined) throw new Error('Unable to read the local server token.');
-        const dataDir = getDataDir();
-        const persisted = persistedKimiOAuthRef();
-        let outputReady = false;
-        const pendingStatuses: string[] = [];
-        const onStatus = (status: RemoteControlStatus): void => {
-          const line = formatRemoteControlStatus(status);
-          if (outputReady) deps.stdout.write(line);
-          else pendingStatuses.push(line);
-        };
-        remoteControl = await (deps.startRemoteControl ?? startRemoteControl)({
-          homeDir: dataDir,
-          localOrigin: origin,
-          localServerToken: token,
-          clientVersion: `kimi-code/${getVersion()}`,
-          configuredOAuthKey: persisted?.key,
-          configuredOAuthHost: persisted?.oauthHost,
-          stderr: deps.stderr,
-          onStatus,
-        });
-        const qrCode = await generateRemoteControlQr(remoteControl.url, dataDir);
-        deps.stdout.write(
-          formatRemoteControlOutput({
-            url: remoteControl.url,
+  let writtenPairingPng: PairingPngIdentity | undefined;
+  await run(
+    parsed,
+    {
+      onReady: async (origin, createPairingCode) => {
+        // Resolve the persistent token only once the server is up: a fresh
+        // server writes `server.token` on first boot, so reading it beforehand
+        // would miss first-time starts and the browser would hit the auth gate.
+        // It is printed in the ready banner and rides in the opened Web UI
+        // URL's `#token=` fragment (M5.5); falls back to the plain origin / no
+        // token line when unavailable. When auth is bypassed, the token is
+        // meaningless and is intentionally NOT shown or carried in the URL.
+        const token = parsed.dangerousBypassAuth ? undefined : deps.resolveToken?.();
+        if (opts.remoteControl === true) {
+          if (token === undefined) throw new Error('Unable to read the local server token.');
+          const dataDir = getDataDir();
+          const persisted = persistedKimiOAuthRef();
+          let outputReady = false;
+          const pendingStatuses: string[] = [];
+          const onStatus = (status: RemoteControlStatus): void => {
+            const line = formatRemoteControlStatus(status);
+            if (outputReady) deps.stdout.write(line);
+            else pendingStatuses.push(line);
+          };
+          remoteControl = await (deps.startRemoteControl ?? startRemoteControl)({
+            homeDir: dataDir,
             localOrigin: origin,
             localServerToken: token,
-            deviceName: remoteControl.deviceName,
-            qrCode: qrCode.terminal,
-            pngPath: qrCode.pngPath,
-          }),
-        );
-        outputReady = true;
-        for (const line of pendingStatuses) deps.stdout.write(line);
-        if (opts.open === true) deps.openUrl(remoteControl.url);
-        return;
-      }
-      const print = async (): Promise<void> => {
-        deps.stdout.write(
-          parsed.logLevel === DEFAULT_FOREGROUND_LOG_LEVEL
-            ? formatReadyBanner(origin, parsed.host, {
-                token,
-                networkAddresses: deps.networkAddresses,
-                dangerousBypassAuth: parsed.dangerousBypassAuth,
-                pairingQr: await generatePairingQr(
-                  origin,
-                  parsed.host,
-                  parsed.dangerousBypassAuth ? undefined : createPairingCode(),
-                  deps,
-                ),
-                reprintHint: canReprint ? `kill -USR2 ${process.pid}` : undefined,
-              })
-            : formatReadyLine(origin, token, parsed.dangerousBypassAuth),
-        );
-      };
-      printReady = print;
-      await print();
-      if (opts.open === true) {
-        const openOrigin = browserOpenOrigin(origin);
-        deps.openUrl(token !== undefined ? buildWebUrl(openOrigin, token) : openOrigin);
-      }
-    },
-    onReprint: canReprint
-      ? () => {
-          void printReady?.();
+            clientVersion: `kimi-code/${getVersion()}`,
+            configuredOAuthKey: persisted?.key,
+            configuredOAuthHost: persisted?.oauthHost,
+            stderr: deps.stderr,
+            onStatus,
+          });
+          const qrCode = await generateRemoteControlQr(remoteControl.url, dataDir);
+          deps.stdout.write(
+            formatRemoteControlOutput({
+              url: remoteControl.url,
+              localOrigin: origin,
+              localServerToken: token,
+              deviceName: remoteControl.deviceName,
+              qrCode: qrCode.terminal,
+              pngPath: qrCode.pngPath,
+            }),
+          );
+          outputReady = true;
+          for (const line of pendingStatuses) deps.stdout.write(line);
+          if (opts.open === true) deps.openUrl(remoteControl.url);
+          return;
         }
-      : undefined,
-    onShutdown: async () => {
-      await remoteControl?.close();
+        const print = async (): Promise<void> => {
+          // The pairing QR is generated only for the full banner: the compact
+          // `--log-level` line has no Pairing section, and minting a
+          // single-use code into an undisplayed QR/PNG would leak a secret to
+          // the data dir for nothing (K3).
+          if (parsed.logLevel !== DEFAULT_FOREGROUND_LOG_LEVEL) {
+            deps.stdout.write(formatReadyLine(origin, token, parsed.dangerousBypassAuth));
+            return;
+          }
+          const pairingQr = await generatePairingQr(
+            origin,
+            parsed.host,
+            parsed.dangerousBypassAuth ? undefined : createPairingCode(),
+            deps,
+          );
+          if (pairingQr !== undefined) {
+            // Snapshot what we wrote so shutdown removes the file only while
+            // it still matches this identity (mtime + size); that check
+            // narrows the overwrite race but cannot fully close it.
+            writtenPairingPng = await statPairingPng(getDataDir());
+          }
+          deps.stdout.write(
+            formatReadyBanner(origin, parsed.host, {
+              token,
+              networkAddresses: deps.networkAddresses,
+              dangerousBypassAuth: parsed.dangerousBypassAuth,
+              pairingQr,
+              reprintHint: canReprint ? formatReprintHint(io) : undefined,
+            }),
+          );
+        };
+        printReady = print;
+        await print();
+        if (opts.open === true) {
+          const openOrigin = browserOpenOrigin(origin);
+          deps.openUrl(token !== undefined ? buildWebUrl(openOrigin, token) : openOrigin);
+        }
+      },
+      onReprint: canReprint
+        ? () => {
+            void printReady?.();
+          }
+        : undefined,
+      onShutdown: async () => {
+        await remoteControl?.close();
+        // K3: a Ctrl+C right after pairing must leave no residue, so the
+        // writer takes its PNG back immediately — but only while the file is
+        // still exactly what this run wrote (mtime + size identity), never a
+        // file a concurrently pairing instance has since overwritten. Anything
+        // else is left to the next run's age-gated startup sweep.
+        await removeOwnedPairingQrPng({ dataDir: getDataDir(), owned: writtenPairingPng });
+      },
     },
-  });
+    io,
+  );
+}
+
+/**
+ * The Reprint hint in the banner's pairing block. POSIX keeps the SIGUSR2
+ * one-liner (works with or without a terminal); a Windows foreground TTY gets
+ * the interactive key; Windows without a terminal can only restart.
+ */
+function formatReprintHint(io: InteractiveReprintIo): string {
+  if (process.platform !== 'win32') return `kill -USR2 ${process.pid}`;
+  const interactive = canInteractiveReprint(process.platform, io.stdin, io.stdout);
+  return interactive ? 'press R' : 'restart kimi web';
 }
 
 function formatReadyLine(
@@ -332,13 +501,16 @@ function formatDangerNoticeLines(): string[] {
 
 /**
  * `kimi web` — runs the local server in-process, attached to the current
- * terminal. Resolves only via `process.exit` (SIGINT/SIGTERM).
+ * terminal. Resolves only via `process.exit` (SIGINT/SIGTERM). `io` injects
+ * the streams for the win32 interactive key reprint; defaults to the real
+ * terminal.
  */
 export async function startServerForeground(
   options: ParsedServerOptions,
   hooks: StartForegroundHooks = {},
+  io: InteractiveReprintIo = { stdin: process.stdin, stdout: process.stdout },
 ): Promise<never> {
-  return runServerInProcess(options, hooks);
+  return runServerInProcess(options, hooks, io);
 }
 
 /**
@@ -348,6 +520,7 @@ export async function startServerForeground(
 async function runServerInProcess(
   options: ParsedServerOptions,
   hooks: StartForegroundHooks,
+  io: InteractiveReprintIo,
 ): Promise<never> {
   const version = getVersion();
   // Registers the telemetry provider for `track` / `shutdownTelemetry`; the
@@ -356,10 +529,47 @@ async function runServerInProcess(
 
   let running: RoutedServer | undefined;
   let stopping = false;
+  let stopInteractiveReprint: (() => void) | undefined;
+
+  const reprintError = (error: unknown): void => {
+    running?.logger.error(
+      { err: error instanceof Error ? error : new Error(String(error)) },
+      'reprint hook error',
+    );
+  };
+  const invokeReprintHook = (): Promise<void> =>
+    Promise.resolve()
+      .then(() => hooks.onReprint?.())
+      .catch(reprintError);
+
+  const onSigint = (): void => {
+    void shutdown('SIGINT');
+  };
+  const onSigterm = (): void => {
+    void shutdown('SIGTERM');
+  };
 
   async function shutdown(reason: string): Promise<void> {
     if (stopping) return;
     stopping = true;
+    // K3: detach the one-shot lifecycle listeners now that shutdown is under
+    // way, so any further SIGINT/SIGTERM falls through to Node's default hard
+    // termination instead of re-entering this no-op guard. Symmetric for both
+    // signals.
+    process.removeListener('SIGINT', onSigint);
+    process.removeListener('SIGTERM', onSigterm);
+    // Restore the terminal first: raw mode would otherwise survive every
+    // await below (and process.exit) and eat the user's keystrokes. A console
+    // that refuses the restore is logged and skipped — it must never stop the
+    // shutdown from reaching process.exit.
+    try {
+      stopInteractiveReprint?.();
+    } catch (error) {
+      running?.logger.error(
+        { err: error instanceof Error ? error : new Error(String(error)) },
+        'terminal restore failed',
+      );
+    }
     running?.logger.info({ reason }, 'server shutting down');
     try {
       await hooks.onShutdown?.(reason);
@@ -431,26 +641,13 @@ async function runServerInProcess(
 
   track('server_started', { daemon: false });
 
-  process.once('SIGINT', () => {
-    void shutdown('SIGINT');
-  });
-  process.once('SIGTERM', () => {
-    void shutdown('SIGTERM');
-  });
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
   if (hooks.onReprint !== undefined && process.platform !== 'win32') {
     // SIGUSR2 is POSIX-only: `process.on('SIGUSR2')` throws ERR_UNKNOWN_SIGNAL
-    // on Windows, so the reprint hook is never registered there even when a
-    // caller supplies one.
-    const onReprint = hooks.onReprint;
+    // on Windows, where the interactive key listener takes over instead.
     process.on('SIGUSR2', () => {
-      void Promise.resolve()
-        .then(onReprint)
-        .catch((error) => {
-          running?.logger.error(
-            { err: error instanceof Error ? error : new Error(String(error)) },
-            'reprint hook error',
-          );
-        });
+      void invokeReprintHook();
     });
   }
 
@@ -466,6 +663,36 @@ async function runServerInProcess(
       await shutdownTelemetry({ timeoutMs: CLI_SHUTDOWN_TIMEOUT_MS }).catch(() => {});
     }
     throw error;
+  }
+
+  if (
+    hooks.onReprint !== undefined &&
+    canInteractiveReprint(process.platform, io.stdin, io.stdout)
+  ) {
+    // Windows foreground TTY: the raw-mode `R` key reprints (a fresh pairing
+    // QR); Ctrl+C is forwarded to the graceful SIGINT shutdown instead of
+    // being swallowed by raw mode. The TUI's `/web`/`/rc` handoff never
+    // supplies `onReprint`, so its own stdin handling is untouched.
+    try {
+      const stopKeys = startInteractiveReprint(
+        io,
+        () => void invokeReprintHook(),
+        () => void shutdown('SIGINT'),
+      );
+      // Abnormal exits (an uncaught error anywhere, process.exit not via
+      // shutdown) would otherwise leave the terminal stuck in raw mode; the
+      // 'exit' hook hands it back synchronously on every exit path. The stop
+      // function is idempotent, so running after shutdown's own restore is a
+      // no-op.
+      const restoreTerminal = (): void => {
+        stopKeys();
+        process.off('exit', restoreTerminal);
+      };
+      process.on('exit', restoreTerminal);
+      stopInteractiveReprint = restoreTerminal;
+    } catch (error) {
+      reprintError(error);
+    }
   }
 
   return new Promise<never>(() => {

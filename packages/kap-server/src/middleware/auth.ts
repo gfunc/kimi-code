@@ -1,8 +1,9 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import { errEnvelope } from '../envelope';
+import { setRequestIdentity } from './identity';
 import type { IAuthTokenService } from '../services/auth/authTokenService';
-import type { CredentialValidator } from '../services/auth/credentials';
+import { isAcceptedIdentity, type CredentialValidator } from '../services/auth/credentials';
 import {
   AUTH_RATE_LIMIT_CODE,
   AUTH_RATE_LIMIT_MSG,
@@ -62,7 +63,7 @@ export function createAuthHook(
 ): (req: FastifyRequest, reply: FastifyReply) => Promise<FastifyReply | void> {
   const isBypassed = opts?.isBypassed ?? defaultIsBypassed;
   const validateCredential: CredentialValidator =
-    opts?.validateCredential ?? ((candidate) => authTokenService.isValid(candidate));
+    opts?.validateCredential ?? ((candidate) => authTokenService.identify(candidate));
 
   return async (req, reply) => {
     if (opts?.limiter?.isBanned(req.ip) === true) {
@@ -85,9 +86,11 @@ export function createAuthHook(
       return reply.code(401).send(errEnvelope(AUTH_ERROR_CODE, AUTH_ERROR_MSG, req.id));
     }
 
-    if (!(await validateCredential(token))) {
+    const identity = await validateCredential(token);
+    if (!isAcceptedIdentity(identity)) {
       opts?.limiter?.recordFailure(req.ip);
       return reply.code(401).send(errEnvelope(AUTH_ERROR_CODE, AUTH_ERROR_MSG, req.id));
     }
+    setRequestIdentity(req, identity);
   };
 }

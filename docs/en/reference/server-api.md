@@ -25,6 +25,8 @@ All `/api/*` paths (including `/openapi.json` and `/asyncapi.json`) require the 
 
 How to carry it: REST uses the `Authorization: Bearer <token>` header; the WebSocket upgrade accepts the same header or the subprotocol `kimi-code.bearer.<token>`. Token generation and rotation are covered in [Using Kimi Code in the browser: Getting started](../guides/web.md#getting-started).
 
+Accepted credentials come in four kinds, all carried the same way: the server token, a paired device token, the password (`KIMI_CODE_PASSWORD`), and an RPC token issued to host-side integrations. All four open the same API surface — a device token is an identity label, not a restricted scope: it can create sessions, submit prompts that run shell tools, and manage files, plugins, and MCP servers like any other credential. On the REST surface the exceptions are the host-only routes — `POST /api/v1/shutdown` and [device management](#devices) — which accept the server token, the password, and the RPC token, but answer a device token with HTTP 403 and envelope code `40302`. That rejection is REST-shaped: the debug WebSocket `/api/v1/debug/ws` (mounted only with `--debug-endpoints` on loopback, not a stable protocol) also refuses device tokens, but a WebSocket upgrade there fails with a plain HTTP 401 instead.
+
 Failed authentication returns HTTP 401 with envelope code `40101`. On non-loopback binds, a source that fails authentication 10 times within 60 seconds is banned for 60 seconds, during which every request gets HTTP 429 (code `42901`).
 
 ### Response envelope
@@ -65,7 +67,8 @@ Error codes are grouped by band:
 | `0` | Success | |
 | `400xx` | Bad request | `40001` validation failed (`details` lists each field), `40003` provider is OAuth-managed |
 | `401xx` | Auth and readiness | `40101` unauthorized, `40110` no provider configured, `40113` model not resolved |
-| `404xx` | Not found | `40401` session, `40408` MCP server, `40409` file path |
+| `403xx` | Forbidden | `40302` host-only route — device token not accepted |
+| `404xx` | Not found | `40401` session, `40408` MCP server, `40409` file path, `40421` device |
 | `409xx` | State conflict | `40901` session busy, `40902` approval already resolved, `40922` page conditions mismatch `page_token` |
 | `410xx` | Expired | `41001` approval timed out, `41002` question timed out, `41003` temporary file expired |
 | `413xx` | Size or boundary exceeded | `41302` file read over 10 MB, `41304` path escapes the session directory |
@@ -149,9 +152,11 @@ Endpoints are grouped by resource below. A `:{action}` suffix in a path is the a
 | --- | --- |
 | `GET /api/v1/healthz` | Liveness probe; auth-exempt |
 | `GET /api/v1/meta` | Server version, capability map, `server_id`, experimental flags |
-| `POST /api/v1/shutdown` | Graceful shutdown (replies 200 first); mounted only on loopback binds |
+| `POST /api/v1/shutdown` | Graceful shutdown (replies 200 first); mounted only on loopback binds; host credentials required |
 | `POST /api/v1/pairing/exchange` | Exchange a one-time LAN pairing code for a device bearer token; auth-exempt |
 | `GET /api/v1/notifications/config` | ntfy push-notification coordinates for paired clients (experimental) |
+| `GET /api/v1/devices` | List paired device tokens; host credentials required |
+| `POST /api/v1/devices/{device_id}:revoke` | Revoke one paired device and close its live connections; host credentials required |
 
 #### `GET /api/v1/healthz`
 
@@ -168,7 +173,8 @@ On success, `data` carries:
 | Field | Type | Description |
 | --- | --- | --- |
 | `server_version` | string | Server version |
-| `capabilities` | object | Capability map — `websocket`, `file_upload`, `fs_query`, `mcp`, `tasks`, `terminal`, all always `true` |
+| `capabilities` | object | Capability map — `websocket`, `file_upload`, `fs_query`, `mcp`, `tasks`, `terminal`, all always `true`, plus `mobile_api` below |
+| `capabilities.mobile_api` | object | Mobile-app API surface: `pairing_exchange`, `agent_id_abort`, `plan_control_clear`, `notifications_config`, `device_management`, all always `true`. It says these endpoints exist on this server — not that any device is authorized, nor that push notifications are enabled |
 | `server_id` | string | Unique id of this server instance |
 | `started_at` | string | Boot time, ISO 8601 |
 | `open_in_apps` | array | Host apps usable as `open-in` targets (`finder` / `cursor` / `vscode` / `iterm` / `terminal`); currently always empty |
@@ -180,7 +186,7 @@ On success, `data` carries:
 
 #### `POST /api/v1/shutdown`
 
-Asks the server to shut down gracefully. The reply is sent first and the shutdown runs immediately after, so the caller can trust the response it received. The route is mounted only on loopback binds — on a non-loopback bind it is not registered at all (requests hit a 404) unless the server was started with `--allow-remote-shutdown`.
+Asks the server to shut down gracefully. The reply is sent first and the shutdown runs immediately after, so the caller can trust the response it received. The route is mounted only on loopback binds — on a non-loopback bind it is not registered at all (requests hit a 404) unless the server was started with `--allow-remote-shutdown`. It also requires host credentials: a device token is rejected with HTTP 403 and envelope code `40302` (see [Authentication](#authentication)).
 
 On success, `data` is `{ "ok": true }`.
 
@@ -192,11 +198,11 @@ Exchanges the one-time pairing code embedded in the `kimi://pair?…` QR printed
 | --- | --- | --- | --- |
 | `code` | body | string | **Required.** Pairing code from the QR payload |
 
-On success, `data` is `{ token, scope: "device" }`: `token` is the device's bearer token, stored server-side only as a SHA-256 hash in `~/.kimi-code/server/auth/device-tokens.json`, so it keeps working across server restarts. Failure returns HTTP 401 with envelope code `40101` (`Invalid or expired pairing code`) — the code is unknown, expired, or already used.
+On success, `data` is `{ token, scope: "device", device_id }`: `token` is the device's bearer token, stored server-side only as a SHA-256 hash in `~/.kimi-code/server/auth/device-tokens.json`, so it keeps working across server restarts; `device_id` is the id the new pairing gets in the [device list](#get-api-v1-devices). Failure returns HTTP 401 with envelope code `40101` (`Invalid or expired pairing code`) — the code is unknown, expired, or already used.
 
 #### `GET /api/v1/notifications/config`
 
-Returns the ntfy push-notification coordinates that paired clients subscribe with (experimental — requires the `ntfy_notifications` flag, enabled by `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS`; see [Push notifications with ntfy](../guides/web.md#push-notifications-with-ntfy-experimental)). Unlike the pairing exchange, this route requires the bearer token like every other authenticated endpoint.
+Returns the ntfy push-notification coordinates that paired clients subscribe with (experimental — requires the `ntfy_notifications` flag, enabled by `KIMI_CODE_EXPERIMENTAL_NTFY_NOTIFICATIONS`; see [Push notifications with ntfy](../guides/web.md#push-notifications-with-ntfy-experimental)). Unlike the pairing exchange, this route requires the bearer token like every other authenticated endpoint. Its field names are snake_case — unlike the camelCase keys the same settings use in the [`GET /api/v1/config` projection](#get-api-v1-config).
 
 On success, `data` carries:
 
@@ -209,6 +215,30 @@ On success, `data` carries:
 | `subscription_token` | string | ntfy access token subscribing clients authenticate with; `null` when unset. The server's publish `token` is never included |
 | `min_priority` | integer | Minimum ntfy priority (1–5) the server publishes |
 | `events` | string[] | Events the server publishes |
+
+### Devices
+
+These endpoints manage the device tokens issued through [pairing](#post-api-v1-pairing-exchange). They are host-only routes (see [Authentication](#authentication)): the server token, the password, and the RPC token are accepted, while a device token gets HTTP 403 with envelope code `40302`.
+
+#### `GET /api/v1/devices`
+
+Lists the device tokens paired with this server. Token hashes are never returned.
+
+On success, `data` is `{ devices }` where each item is `{ device_id, created_at }` — the id that `:revoke` takes, and the ISO 8601 time the device was paired.
+
+#### `POST /api/v1/devices/{device_id}:revoke`
+
+Revokes one paired device token. There is no request body.
+
+| Parameter | In | Type | Description |
+| --- | --- | --- | --- |
+| `device_id` | path | string | **Required.** Device id from `GET /api/v1/devices` |
+
+On success, `data` is `{ device_id, revoked: true }`. An unknown id returns envelope code `40421`. Revocation takes effect as follows:
+
+- The token stops authenticating: every subsequent REST request with it fails with HTTP 401 (`40101`).
+- On the instance that handled the revoke, live WebSocket connections authenticated with that token are closed immediately with close code `4401`. Other instances sharing the home directory re-validate their connections' credentials about every 30 seconds and close them then (see [Connect](#connect)).
+- `kimi web rotate-token` does not revoke devices — rotation only replaces the server token.
 
 ### Login and usage
 
@@ -307,7 +337,7 @@ On success, `data` is `{ region }` with `region` one of `mainland-cn` / `global`
 
 #### `GET /api/v1/config`
 
-Returns the resolved global configuration — the effective result of `config.toml` plus overlays. Secrets are redacted: each provider reports only `has_api_key`, never the stored key.
+Returns the resolved global configuration — the effective result of `config.toml` plus overlays. Secrets are redacted: each provider reports only `has_api_key`, never the stored key, and the `notifications` domain is projected to its safe fields — the ntfy publish `token` and `subscription_token` never appear in this response, in the `event.config.changed` payload, or in the debug config RPC; the subscription token is served only by `GET /api/v1/notifications/config`. This projection keeps the domain's camelCase keys (`ntfyUrl`, `minPriority`); the dedicated `GET /api/v1/notifications/config` route reports the same settings under snake_case names (`ntfy_url`, `min_priority`).
 
 On success, `data` is the config object; its fields mirror the top-level domains documented under [Top-level fields](../configuration/config-files.md#top-level-fields):
 
@@ -332,6 +362,7 @@ On success, `data` is the config object; its fields mirror the top-level domains
 | `subagent` | object | Subagent configuration |
 | `secondary_model` | object | Secondary model pool for subagents |
 | `experimental` | object | Experimental flag id → enabled |
+| `notifications` | object | ntfy push settings (see [Push notifications with ntfy](../guides/web.md#push-notifications-with-ntfy-experimental)) — only `enabled`, `ntfyUrl`, `topic`, `minPriority`, `events`; the ntfy tokens are never included |
 | `telemetry` | boolean | Whether anonymous telemetry is enabled |
 | `auto_session_title` | boolean | Whether clients may automatically generate session titles |
 | `raw` | object | Raw parsed `config.toml` content, unmodeled fields included |
@@ -2378,13 +2409,14 @@ The only endpoint is `ws://<host>:<port>/api/v1/ws`; authentication happens at t
   "payload": {
     "ws_connection_id": "conn_01JZX4...",
     "protocol_version": 2,
+    "heartbeat_ms": 10000,
     "max_event_buffer_size": 1000,
     "capabilities": { "event_batching": false, "compression": false }
   }
 }
 ```
 
-Note that the server never sends heartbeats and never disconnects an idle connection — keepalive and reconnection are the client's job.
+The server heartbeats every connection: it sends a `ping` frame every 10 seconds (the interval is advertised as `heartbeat_ms` in `server_hello`), and it closes a connection that has produced no inbound frame for two consecutive intervals (about 20 seconds) with close code `1001` (`heartbeat timeout`). Any inbound frame — the `pong` reply, an ack, any other frame — resets that timer, so a receive-only client should answer each `ping` with a `pong`; reconnection is still the client's job. The other server-initiated close is credential revocation: a connection authenticated with a server or device token that no longer validates is closed with close code `4401` (`credential revoked`). Credentials are re-validated about every 30 seconds, so after a device `:revoke` handled by one instance (which closes that device's connections immediately) or a `kimi web rotate-token`, the affected connections close within that window on every instance.
 
 ### Control frames
 

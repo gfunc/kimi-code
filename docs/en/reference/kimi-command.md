@@ -180,7 +180,7 @@ Multiple instances can share one home directory: each registers itself under `~/
 
 `kimi web` binds to local loopback only by default and prints the bearer token in the startup banner; the web UI authenticates automatically via the `#token=` URL fragment.
 
-With `--host`, the banner also prints a `kimi://pair?…` QR for the Kimi mobile app. The embedded pairing code expires 60 seconds after it is printed and is single-use; the banner's `Reprint:` hint (`kill -USR2 <pid>`) prints a fresh one without restarting. See [Using Kimi Code in the browser](../guides/web.md#pair-the-kimi-mobile-app-over-lan).
+With `--host`, the banner also prints a `kimi://pair?…` QR for the Kimi mobile app. The embedded pairing code expires 60 seconds after it is printed and is single-use; the banner's `Reprint:` hint prints a fresh one without restarting — on macOS and Linux run the shown `kill -USR2 <pid>`, in a Windows interactive terminal press `R` (with no interactive terminal, restart `kimi web`). See [Using Kimi Code in the browser](../guides/web.md#pair-the-kimi-mobile-app-over-lan).
 
 ::: info
 The `kimi server` command tree is deprecated: any `kimi server …` invocation (including all legacy subcommands) only prints a deprecation notice and exits with code 1 — use `kimi web` instead. The one exception is `kimi server kill`, which stays functional for stopping servers started by a version before 0.28.0. The notice will be removed in the next major version of Kimi Code.

@@ -163,4 +163,52 @@ describe('WS upgrade auth', () => {
     const debugUrl = `${v1Url().replace('/api/v1/ws', '/api/v1/debug/ws')}`;
     await expectRejected(debugUrl, { protocols: [`kimi-code.bearer.${token()}`] });
   });
+
+  it('rejects a runtime boolean-false identity instead of accepting the upgrade', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'kimi-kap-false-identity-ws-'));
+    const falseIdentityAuth = {
+      ...fixedTokenAuth('tok'),
+      identify: async () => false,
+    } as unknown as Parameters<typeof startServer>[0]['authTokenService'];
+    const server = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
+      host: '127.0.0.1',
+      port: 0,
+      homeDir: home,
+      logLevel: 'silent',
+      authTokenService: falseIdentityAuth,
+    });
+    try {
+      await expectRejected(`ws://127.0.0.1:${server.port}/api/v1/ws`, {
+        protocols: ['kimi-code.bearer.tok'],
+      });
+    } finally {
+      await server.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a device token on the debug WS upgrade', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'kimi-kap-debug-device-ws-'));
+    const server = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
+      host: '127.0.0.1',
+      port: 0,
+      homeDir: home,
+      logLevel: 'silent',
+      debugEndpoints: true,
+    });
+    try {
+      const exchange = await server.authTokenService.exchangePairingCode(
+        server.authTokenService.createPairingCode(),
+      );
+      expect(exchange).toBeDefined();
+      await expectRejected(`ws://127.0.0.1:${server.port}/api/v1/debug/ws`, {
+        protocols: [`kimi-code.bearer.${exchange!.token}`],
+      });
+    } finally {
+      await server.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });

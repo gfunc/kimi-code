@@ -87,10 +87,20 @@ import { createRemoteControlManager } from '@moonshot-ai/remote-control';
 
 import { createAuthTokenService, type IAuthTokenService } from './services/auth/authTokenService';
 import { registerPairingRoutes } from './routes/pairing';
-import { createCredentialValidator } from './services/auth/credentials';
+import { registerDevicesRoutes } from './routes/devices';
+import {
+  createCredentialValidator,
+  isAcceptedIdentity,
+} from './services/auth/credentials';
 import { createDeviceTokenStore, type DeviceTokenStore } from './services/auth/deviceTokenStore';
 import { resolvePasswordHash } from './services/auth/password';
 import { createTokenStore } from './services/auth/tokenStore';
+import {
+  createConnectionCredentialGuard,
+  type ConnectionCredentialGuard,
+} from './transport/ws/credentialGuard';
+import type { WsAuthContext } from './transport/ws/v1/registerWsV1';
+import type { AuthIdentity } from './services/auth/credentials';
 
 import { drainGlobalSearchDisposals, IGlobalSearchService } from './search/searchService';
 
@@ -118,6 +128,7 @@ export interface ServerStartOptions {
   readonly allowRemoteShutdown?: boolean;
   readonly authTokenService?: IAuthTokenService;
   readonly disableAuth?: boolean;
+  readonly wsCredentialRecheckIntervalMs?: number;
   readonly webTitle?: string;
   readonly rpcToken?: string;
   readonly seeds?: ScopeSeed;
@@ -141,6 +152,7 @@ export interface RunningServer {
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 58627;
+const DEFAULT_WS_CREDENTIAL_RECHECK_MS = 30_000;
 
 export async function startServer(opts: ServerStartOptions): Promise<RunningServer> {
   const host = opts.host ?? DEFAULT_HOST;
@@ -202,6 +214,13 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     });
   }
   const validateCredential = createCredentialValidator(authTokenService, opts.rpcToken);
+  const credentialGuard: ConnectionCredentialGuard | undefined =
+    opts.disableAuth === true ? undefined : createConnectionCredentialGuard();
+  const wsAuthContexts = new WeakMap<IncomingMessage, WsAuthContext>();
+  credentialGuard?.startRevalidation(
+    validateCredential,
+    opts.wsCredentialRecheckIntervalMs ?? DEFAULT_WS_CREDENTIAL_RECHECK_MS,
+  );
   const logging = resolveLoggingConfig({ homeDir, env: process.env });
   let boundPort = port;
   const localOriginHost = host.includes(':') ? `[${host}]` : host;
@@ -337,6 +356,7 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     capabilityInstallSubscription.dispose();
     authFailureLimiter?.dispose();
     modelCatalogRefreshScheduler.dispose();
+    credentialGuard?.dispose();
     await deviceTokenStore?.dispose();
     try {
       await shutdownServerTelemetry(telemetry);
@@ -470,6 +490,11 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     authTokenService,
   );
 
+  registerDevicesRoutes(app as unknown as Parameters<typeof registerDevicesRoutes>[0], {
+    authTokenService,
+    guard: credentialGuard,
+  });
+
   await registerApiV1Routes(app, core, {
     serverVersion,
     hostIdentity: opts.hostIdentity,
@@ -513,6 +538,8 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
     registry: connectionRegistry,
     broadcaster,
     logger,
+    guard: credentialGuard,
+    authContext: (req) => wsAuthContexts.get(req),
   });
   const wssDebug = debugEndpoints ? registerWsDebug() : undefined;
 
@@ -554,10 +581,11 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
       const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : null;
       const protocolToken = extractWsBearerToken(req.headers['sec-websocket-protocol']);
       const candidate = bearerToken !== null && bearerToken.length > 0 ? bearerToken : protocolToken;
-      let ok = false;
-      if (candidate !== null) {
+      const credential = candidate ?? undefined;
+      let identity: AuthIdentity | undefined;
+      if (credential !== undefined) {
         try {
-          ok = await validateCredential(candidate);
+          identity = await validateCredential(credential);
         } catch (error) {
           logger.warn(
             {
@@ -568,10 +596,10 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
             },
             'ws upgrade rejected',
           );
-          ok = false;
+          identity = undefined;
         }
       }
-      if (!ok) {
+      if (credential === undefined || !isAcceptedIdentity(identity)) {
         logger.warn(
           {
             remoteAddress: req.socket.remoteAddress,
@@ -583,6 +611,22 @@ export async function startServer(opts: ServerStartOptions): Promise<RunningServ
         (socket as Socket).write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
         (socket as Socket).destroy();
         return;
+      }
+      if (wss === wssDebug && identity.kind === 'device') {
+        logger.warn(
+          {
+            remoteAddress: req.socket.remoteAddress,
+            path: url,
+            reason: 'device_token_not_allowed_on_debug',
+          },
+          'ws upgrade rejected',
+        );
+        (socket as Socket).write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        (socket as Socket).destroy();
+        return;
+      }
+      if (credentialGuard !== undefined) {
+        wsAuthContexts.set(req, { credential, identity });
       }
     }
 

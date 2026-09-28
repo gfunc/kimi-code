@@ -27,6 +27,17 @@ interface Envelope<T> {
   request_id: string;
 }
 
+const NOTIFICATIONS_WITH_CREDENTIALS_TOML = [
+  '[notifications]',
+  'enabled = true',
+  'ntfy_url = "https://ntfy.example.test"',
+  'topic = "kc-leak-topic"',
+  'token = "tk-publish-leak"',
+  'subscription_token = "tk-sub-leak"',
+  'min_priority = 2',
+  '',
+].join('\n');
+
 describe('server-v2 /api/v1/config', () => {
   let server: RunningServer | undefined;
   let home: string | undefined;
@@ -188,6 +199,35 @@ describe('server-v2 /api/v1/config', () => {
     }
   });
 
+  it('GET omits notification credentials while keeping the non-sensitive fields', async () => {
+    await boot(NOTIFICATIONS_WITH_CREDENTIALS_TOML);
+    const res = await authedFetch(server as RunningServer, base, '/api/v1/config');
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    expect(raw).not.toContain('tk-publish-leak');
+    expect(raw).not.toContain('tk-sub-leak');
+    const body = JSON.parse(raw) as Envelope<ConfigResponse>;
+    expect(body.data['notifications']).toMatchObject({
+      enabled: true,
+      ntfyUrl: 'https://ntfy.example.test',
+      topic: 'kc-leak-topic',
+      minPriority: 2,
+    });
+  });
+
+  it('POST /config echo omits notification credentials after a yolo toggle', async () => {
+    await boot(NOTIFICATIONS_WITH_CREDENTIALS_TOML);
+    const res = await authedFetch(server as RunningServer, base, '/api/v1/config', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yolo: true }),
+    });
+    expect(res.status).toBe(200);
+    const raw = await res.text();
+    expect(raw).not.toContain('tk-publish-leak');
+    expect(raw).not.toContain('tk-sub-leak');
+  });
+
   it('session create with a broken subagent model pool still succeeds', async () => {
     await boot('[secondary_model.models]\n"provider/fast" = "fast and cheap"\n');
     const res = await authedFetch(server as RunningServer, base, '/api/v1/sessions', {
@@ -330,6 +370,24 @@ describe('server-v2 config changed WS notifications', () => {
     const last = frames.at(-1) as ConfigChangedFrame;
     expect(last.payload.changedFields).toContain('defaultPermissionMode');
     expect(last.payload.config['default_permission_mode']).toBe('yolo');
+  });
+
+  it('omits notification credentials from the published config snapshot', async () => {
+    await boot(NOTIFICATIONS_WITH_CREDENTIALS_TOML);
+    const frames = await openWs();
+
+    await patchConfig({ yolo: true });
+
+    await vi.waitFor(() => expect(frames.length).toBeGreaterThanOrEqual(1));
+    const raw = JSON.stringify(frames);
+    expect(raw).not.toContain('tk-publish-leak');
+    expect(raw).not.toContain('tk-sub-leak');
+    const last = frames.at(-1) as ConfigChangedFrame;
+    expect(last.payload.config['notifications']).toMatchObject({
+      enabled: true,
+      topic: 'kc-leak-topic',
+      minPriority: 2,
+    });
   });
 
   it('closes the config publisher before the app, so a pending change is never delivered during shutdown', async () => {
@@ -477,6 +535,38 @@ describe('configChangedPublisher', () => {
     });
     expect(JSON.stringify(services)).not.toContain('sk-svc');
     expect(JSON.stringify(services)).not.toContain('Bearer abc');
+  });
+
+  it('redacts notification credentials from the published config projection', () => {
+    vi.useFakeTimers();
+    const { published, fire, setBacking } = setup();
+    setBacking({
+      providers: {},
+      notifications: {
+        enabled: true,
+        ntfyUrl: 'https://ntfy.example.test',
+        topic: 'kc-topic',
+        token: 'tk-publish-leak',
+        subscriptionToken: 'tk-sub-leak',
+        minPriority: 2,
+        events: ['work.finished'],
+      },
+    });
+
+    fire('notifications');
+    vi.advanceTimersByTime(50);
+
+    expect(published).toHaveLength(1);
+    const config = published[0]?.payload.config as Record<string, unknown>;
+    expect(config['notifications']).toEqual({
+      enabled: true,
+      ntfyUrl: 'https://ntfy.example.test',
+      topic: 'kc-topic',
+      minPriority: 2,
+      events: ['work.finished'],
+    });
+    expect(JSON.stringify(published)).not.toContain('tk-publish-leak');
+    expect(JSON.stringify(published)).not.toContain('tk-sub-leak');
   });
 
   it('always delivers a trailing event for late-arriving changes', () => {

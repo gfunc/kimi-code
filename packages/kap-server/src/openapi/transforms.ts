@@ -138,6 +138,7 @@ export function transformOpenApiDocument(
   expandSessionActions(paths);
   expandFsActions(paths);
   expandPluginActions(paths);
+  expandDeviceActions(paths);
   expandModelActions(paths);
   expandMcpServerActions(paths);
   expandCapabilityActions(paths);
@@ -276,6 +277,17 @@ function expandPluginActions(paths: Record<string, unknown>): void {
       operationId: 'runPluginRemoveAction',
       description: 'Remove an installed plugin',
       renameTailTo: 'plugin_id',
+    },
+  ]);
+}
+
+function expandDeviceActions(paths: Record<string, unknown>): void {
+  projectActionRoutes(paths, '/api/v1/devices/{tail}', 'post', [
+    {
+      path: '/api/v1/devices/{device_id}:revoke',
+      operationId: 'runDeviceRevokeAction',
+      description: 'Revoke one paired device token and close its live connections',
+      renameTailTo: 'device_id',
     },
   ]);
 }

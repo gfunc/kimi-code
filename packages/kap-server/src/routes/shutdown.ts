@@ -1,8 +1,11 @@
 import { z } from 'zod';
 
-import { okEnvelope } from '../envelope';
-import { requestLog } from '../lib/requestLog';
+import { errEnvelope, okEnvelope } from '../envelope';
+import { requestIdentity } from '../middleware/identity';
 import { defineRoute } from '../middleware/defineRoute';
+import { ErrorCode } from '../protocol/error-codes';
+import { isAcceptedIdentity } from '../services/auth/credentials';
+import { requestLog } from '../lib/requestLog';
 
 interface ShutdownRouteHost {
   post(
@@ -28,10 +31,23 @@ export function registerShutdownRoutes(
       method: 'POST',
       path: '/shutdown',
       success: { data: z.object({ ok: z.literal(true) }) },
-      description: 'Gracefully shut down the server',
+      errors: { [ErrorCode.AUTH_HOST_ONLY]: {} },
+      description: 'Gracefully shut down the server (host identity required)',
       tags: ['meta'],
     },
     (req, reply) => {
+      const identity = requestIdentity(req);
+      if (identity !== undefined && !(isAcceptedIdentity(identity) && identity.kind !== 'device')) {
+        const r = reply as unknown as { code(status: number): { send(payload: unknown): unknown } };
+        r.code(403).send(
+          errEnvelope(
+            ErrorCode.AUTH_HOST_ONLY,
+            'Shutting down the host requires the host server token; device tokens are not allowed',
+            req.id,
+          ),
+        );
+        return;
+      }
       requestLog(req)?.info(
         { remoteAddress: (req as unknown as { ip?: string }).ip },
         'shutdown requested',

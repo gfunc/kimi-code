@@ -4,6 +4,16 @@ import { isoDateTimeSchema } from '@moonshot-ai/agent-core-v2/_base/utils/isoDat
 
 import { fsOpenInAppIdSchema } from './rest-fs';
 
+export const mobileApiCapabilitySchema = z.object({
+  pairing_exchange: z.literal(true),
+  agent_id_abort: z.literal(true),
+  plan_control_clear: z.literal(true),
+  notifications_config: z.literal(true),
+  device_management: z.literal(true).optional(),
+});
+
+export type MobileApiCapability = z.infer<typeof mobileApiCapabilitySchema>;
+
 export const metaCapabilitiesSchema = z.object({
   websocket: z.literal(true),
   file_upload: z.literal(true),
@@ -11,6 +21,7 @@ export const metaCapabilitiesSchema = z.object({
   mcp: z.literal(true),
   tasks: z.literal(true),
   terminal: z.literal(true),
+  mobile_api: mobileApiCapabilitySchema.optional(),
 });
 
 export type MetaCapabilities = z.infer<typeof metaCapabilitiesSchema>;

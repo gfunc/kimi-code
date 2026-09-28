@@ -5,6 +5,7 @@ import type { IConnectionRegistry } from '../src/transport/ws/connectionRegistry
 import type { SessionEventBroadcaster } from '../src/transport/ws/v1/sessionEventBroadcaster';
 import {
   type WsConnectionV1Options,
+  WS_CLOSE_TERMINATE_MS,
   WsConnectionV1,
   coalesceFrames,
 } from '../src/transport/ws/v1/wsConnectionV1';
@@ -16,6 +17,7 @@ class FakeSocket {
   bufferedAmount = 0;
   sent: string[] = [];
   closeCalls: Array<{ code?: number; reason?: string }> = [];
+  terminateCount = 0;
   private readonly handlers = new Map<string, Array<(...a: unknown[]) => void>>();
 
   on(event: string, cb: (...a: unknown[]) => void): this {
@@ -36,6 +38,7 @@ class FakeSocket {
   }
 
   terminate(): void {
+    this.terminateCount += 1;
     this.readyState = this.CLOSED;
     this.emit('close');
   }
@@ -898,5 +901,78 @@ describe('WsConnectionV1 global target registration', () => {
     );
     await vi.waitFor(() => expect(diOptIns).toEqual([conn]));
     conn.close();
+  });
+});
+
+describe('WsConnectionV1 revoke', () => {
+  it('closes with 4401 credential revoked and stops processing inbound frames', async () => {    const socket = new FakeSocket();
+    const conn = makeConn(socket);
+    const helloCount = socket.sent.length;
+    expect(helloCount).toBeGreaterThan(0);
+
+    socket.emit(
+      'message',
+      JSON.stringify({ type: 'client_hello', id: 'pre', payload: {} }),
+    );
+    await vi.waitFor(() => {
+      expect(socket.frames().some((frame) => (frame as { id?: string }).id === 'pre')).toBe(true);
+    });
+
+    conn.revoke();
+    expect(socket.closeCalls).toEqual([{ code: 4401, reason: 'credential revoked' }]);
+
+    const afterRevoke = socket.sent.length;
+    socket.emit(
+      'message',
+      JSON.stringify({ type: 'client_hello', id: 'post', payload: {} }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(socket.sent).toHaveLength(afterRevoke);
+    expect(socket.frames().some((frame) => (frame as { id?: string }).id === 'post')).toBe(false);
+  });
+
+  it('is idempotent and stays closed after a second revoke', () => {
+    const socket = new FakeSocket();
+    const conn = makeConn(socket);
+
+    conn.revoke();
+    conn.revoke();
+    expect(socket.closeCalls).toEqual([{ code: 4401, reason: 'credential revoked' }]);
+  });
+
+  it('terminates the socket when the peer never completes the close handshake', () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeSocket();
+      socket.close = (code?: number, reason?: string): void => {
+        socket.closeCalls.push({ code, reason });
+        socket.readyState = socket.CLOSED;
+      };
+      const conn = makeConn(socket);
+
+      conn.revoke();
+      expect(socket.closeCalls).toEqual([{ code: 4401, reason: 'credential revoked' }]);
+
+      vi.advanceTimersByTime(WS_CLOSE_TERMINATE_MS - 1);
+      expect(socket.terminateCount).toBe(0);
+      vi.advanceTimersByTime(1);
+      expect(socket.terminateCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not terminate when the peer completes the close handshake', () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeSocket();
+      const conn = makeConn(socket);
+
+      conn.revoke();
+      vi.advanceTimersByTime(WS_CLOSE_TERMINATE_MS + 1000);
+      expect(socket.terminateCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -180,7 +180,7 @@ kimi web --port 58628    # 指定绑定端口
 
 `kimi web` 默认只绑定本机 loopback 地址，并在启动横幅中打印 bearer token；web UI 通过 URL 的 `#token=` 片段自动完成鉴权。
 
-带 `--host` 启动时，横幅还会打印一张供 Kimi 手机 App 扫码的 `kimi://pair?…` 二维码。其中的配对码在打印 60 秒后过期且只能使用一次；横幅中的 `Reprint:` 提示（`kill -USR2 <pid>`）可以不重启服务就换一张新的。详见[在网页中使用](../guides/web.md#与-kimi-手机-app-局域网配对)。
+带 `--host` 启动时，横幅还会打印一张供 Kimi 手机 App 扫码的 `kimi://pair?…` 二维码。其中的配对码在打印 60 秒后过期且只能使用一次；横幅中的 `Reprint:` 提示可以不重启服务就换一张新的——macOS 和 Linux 上执行提示给出的 `kill -USR2 <pid>`，Windows 交互式终端里按 `R`（没有交互式终端时，重启 `kimi web` 即可）。详见 [在网页中使用](../guides/web.md#与-kimi-手机-app-局域网配对)。
 
 ::: info 提示
 `kimi server` 命令树已废弃：任何 `kimi server …` 调用（含全部旧子命令）只会打印弃用提示并以退出码 1 结束，请改用 `kimi web`。唯一的例外是 `kimi server kill`，它仍然可用，仅用于停止 0.28.0 之前版本启动的服务。该提示将在 Kimi Code 下个大版本移除。

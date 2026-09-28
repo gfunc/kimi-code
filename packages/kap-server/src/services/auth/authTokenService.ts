@@ -2,7 +2,8 @@ import { randomBytes } from 'node:crypto';
 
 import { createDecorator } from '@moonshot-ai/agent-core-v2';
 
-import type { DeviceTokenStore } from './deviceTokenStore';
+import type { AuthIdentity } from './credentials';
+import type { DeviceTokenRecord, DeviceTokenStore } from './deviceTokenStore';
 import { verifyPassword } from './password';
 import type { TokenStore } from './tokenStore';
 
@@ -12,9 +13,10 @@ interface PairingCode {
   readonly expiresAt: number;
 }
 
-interface PairingExchange {
+export interface PairingExchange {
   readonly token: string;
   readonly scope: 'device';
+  readonly deviceId: string;
 }
 
 export interface IAuthTokenService {
@@ -24,11 +26,17 @@ export interface IAuthTokenService {
 
   isValid(candidate: string): Promise<boolean>;
 
+  identify(candidate: string): Promise<AuthIdentity | undefined>;
+
   createPairingCode(): string;
 
   exchangePairingCode(code: string): Promise<PairingExchange | undefined>;
 
   revokeDeviceToken(candidate: string): Promise<boolean>;
+
+  listDevices(): readonly DeviceTokenRecord[];
+
+  revokeDeviceById(deviceId: string): Promise<boolean>;
 }
 
 export const IAuthTokenService =
@@ -56,6 +64,13 @@ export function createAuthTokenService(deps: {
       deps.tokenStore.isValid(candidate) ||
       deps.deviceTokenStore.has(candidate) ||
       (await verifyPassword(candidate, deps.passwordHash)),
+    identify: async (candidate) => {
+      if (deps.tokenStore.isValid(candidate)) return { kind: 'server' };
+      const device = deps.deviceTokenStore.find(candidate);
+      if (device !== undefined) return { kind: 'device', deviceId: device.id };
+      if (await verifyPassword(candidate, deps.passwordHash)) return { kind: 'password' };
+      return undefined;
+    },
     createPairingCode: () => {
       removeExpired();
       const code = randomBytes(24).toString('base64url');
@@ -68,9 +83,11 @@ export function createAuthTokenService(deps: {
       if (pairing === undefined) return undefined;
       pairingCodes.delete(code);
       const token = randomBytes(32).toString('base64url');
-      await deps.deviceTokenStore.add(token);
-      return { token, scope: 'device' };
+      const deviceId = await deps.deviceTokenStore.add(token);
+      return { token, scope: 'device', deviceId };
     },
     revokeDeviceToken: (candidate) => deps.deviceTokenStore.revoke(candidate),
+    listDevices: () => deps.deviceTokenStore.list(),
+    revokeDeviceById: (deviceId) => deps.deviceTokenStore.revokeById(deviceId),
   };
 }

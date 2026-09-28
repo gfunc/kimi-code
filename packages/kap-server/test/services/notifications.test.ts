@@ -20,7 +20,7 @@ import {
   type SessionActivityChangedEvent,
   type SessionActivityState,
 } from '@moonshot-ai/agent-core-v2';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_NOTIFICATIONS_CONFIG,
@@ -450,6 +450,28 @@ describe('NotificationsService', () => {
       expect(inert.client.published).toEqual([]);
       expect(inert.interactions.pendingSubscriptionCount).toBe(0);
     }
+  });
+
+  it('logs enablement without the topic or tokens', async () => {
+    const info = vi.fn();
+    const warn = vi.fn();
+    const service = new NotificationsService({
+      client: satisfiesNtfyClient(new FakeNtfyClient()),
+      sources: { interactions: new FakeInteractions(), sessions: new FakeSessions() },
+      logger: { info, warn },
+    });
+    await service.start(
+      makeCore(
+        makeConfig({ token: 'tk-publish-leak', subscriptionToken: 'tk-sub-leak' }),
+        true,
+      ),
+    );
+
+    expect(info).toHaveBeenCalledTimes(1);
+    const logged = JSON.stringify(info.mock.calls);
+    expect(logged).not.toContain('kc-test-topic');
+    expect(logged).not.toContain('tk-publish-leak');
+    expect(logged).not.toContain('tk-sub-leak');
   });
 
   it('drops events below min_priority', async () => {

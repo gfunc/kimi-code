@@ -34,6 +34,13 @@ export function registerMetaRoute(app: RouteHost, opts: MetaRouteOptions): void 
       mcp: true as const,
       tasks: true as const,
       terminal: true as const,
+      mobile_api: Object.freeze({
+        pairing_exchange: true as const,
+        agent_id_abort: true as const,
+        plan_control_clear: true as const,
+        notifications_config: true as const,
+        device_management: true as const,
+      }),
     }),
     server_id: opts.serverId,
     started_at: opts.startedAt,

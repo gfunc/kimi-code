@@ -144,7 +144,7 @@ export class NotificationsService {
         }),
       );
     }
-    this.opts.logger?.info({ topic: section.topic }, 'ntfy notifications enabled');
+    this.opts.logger?.info('ntfy notifications enabled');
   }
 
   onRemoteControlStatus(status: RemoteControlStatus): void {

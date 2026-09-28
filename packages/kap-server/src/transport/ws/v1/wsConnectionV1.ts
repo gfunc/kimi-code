@@ -12,6 +12,7 @@ import { ulid } from 'ulid';
 import type { RawData, WebSocket } from 'ws';
 
 import type { CredentialValidator } from '../../../services/auth/credentials';
+import { isAcceptedIdentity } from '../../../services/auth/credentials';
 import type { IConnectionRegistry } from '../connectionRegistry';
 import {
   type EventEnvelope,
@@ -44,6 +45,8 @@ const DEFAULT_MAX_BATCH_SIZE = 64;
 const DEFAULT_HIGH_WATER_MARK_BYTES = 1 << 20;
 const DEFAULT_BACKPRESSURE_RETRY_MS = 5;
 const DEFAULT_BACKPRESSURE_MAX_DELAY_MS = 100;
+
+export const WS_CLOSE_TERMINATE_MS = 5_000;
 
 interface InboundFrame {
   type: string;
@@ -83,6 +86,7 @@ export class WsConnectionV1 implements BroadcastTarget {
   private readonly logger?: JournalLogger;
 
   private closed = false;
+  private revoked = false;
   private gotClientHello = false;
   readonly subscriptions = new Map<string, SessionSubscription>();
   private controlQueue: Promise<void> = Promise.resolve();
@@ -93,6 +97,7 @@ export class WsConnectionV1 implements BroadcastTarget {
   private backpressureSince?: number;
 
   private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private terminateTimer?: ReturnType<typeof setTimeout>;
   private lastInboundAt = Date.now();
 
   constructor(opts: WsConnectionV1Options) {
@@ -136,7 +141,7 @@ export class WsConnectionV1 implements BroadcastTarget {
   }
 
   get subscriptionSessionIds(): readonly string[] {
-    return Array.from(this.subscriptions.keys()).sort();
+    return Array.from(this.subscriptions.keys()).toSorted();
   }
 
   send(envelope: EventEnvelope, delivery: BroadcastDelivery = 'subscription'): void {
@@ -145,7 +150,7 @@ export class WsConnectionV1 implements BroadcastTarget {
   }
 
   private onMessage(data: RawData): void {
-    if (this.closed) return;
+    if (this.closed || this.revoked) return;
     let frame: InboundFrame;
     try {
       frame = JSON.parse(rawDataToString(data)) as InboundFrame;
@@ -394,7 +399,7 @@ export class WsConnectionV1 implements BroadcastTarget {
     if (token === undefined || this.validateCredential === undefined) return true;
     let ok = false;
     try {
-      ok = await this.validateCredential(token);
+      ok = isAcceptedIdentity(await this.validateCredential(token));
     } catch {
       ok = false;
     }
@@ -477,10 +482,30 @@ export class WsConnectionV1 implements BroadcastTarget {
   close(code = 1000, reason?: string): void {
     if (this.closed) return;
     this.flush(true);
+    this.scheduleTerminateGuard();
     try {
       this.socket.close(code, reason);
     } catch {
     }
+  }
+
+  private scheduleTerminateGuard(): void {
+    if (this.terminateTimer !== undefined) return;
+    this.terminateTimer = setTimeout(() => {
+      this.terminateTimer = undefined;
+      if (this.closed) return;
+      try {
+        this.socket.terminate();
+      } catch {
+      }
+    }, WS_CLOSE_TERMINATE_MS);
+    this.terminateTimer.unref?.();
+  }
+
+  revoke(): void {
+    if (this.closed || this.revoked) return;
+    this.revoked = true;
+    this.close(4401, 'credential revoked');
   }
 
   private onClose(): void {
@@ -489,6 +514,10 @@ export class WsConnectionV1 implements BroadcastTarget {
     if (this.flushTimer !== undefined) clearTimeout(this.flushTimer);
     if (this.backpressureRetryTimer !== undefined) clearTimeout(this.backpressureRetryTimer);
     if (this.heartbeatTimer !== undefined) clearInterval(this.heartbeatTimer);
+    if (this.terminateTimer !== undefined) {
+      clearTimeout(this.terminateTimer);
+      this.terminateTimer = undefined;
+    }
     this.outbound = [];
     this.broadcaster.removeGlobalTarget(this);
     for (const sid of this.subscriptions.keys()) this.broadcaster.unsubscribe(sid, this);
